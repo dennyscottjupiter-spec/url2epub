@@ -87,6 +87,12 @@ ensure_packages()
 
 import requests
 from bs4 import BeautifulSoup
+from requests.adapters import HTTPAdapter
+try:
+    # urllib3 ships with requests; this is where the retry policy lives.
+    from urllib3.util.retry import Retry
+except Exception:                       # pragma: no cover - very old/embedded urllib3
+    from requests.packages.urllib3.util.retry import Retry
 
 PARSER = "html.parser" # Python's built-in HTML parser — no compilation ever
 
@@ -98,13 +104,29 @@ TIMEOUT = 30
 MAX_IMAGE_BYTES = 10 * 1024 * 1024 # skip images larger than 10 MB
 MIN_GOOD_TEXT = 500 # chars below this = "weak" extraction
 
+# We present as a REAL modern Android phone — a Samsung Galaxy S24
+# (model SM-S921B, Android 14) running Chrome for Android. This matches the
+# tool's true home (PyDroid 3 on a phone) and, crucially, makes UA-sniffing
+# sites serve us their normal server-rendered *mobile* HTML instead of a bot
+# or "unsupported browser" page. We send the matching Client Hints
+# (Sec-CH-UA*) too, because modern Chrome always does and some sites check.
+#
+# NOTE: we deliberately do NOT set Accept-Encoding — requests picks the
+# encodings it can actually decode (gzip/deflate, plus brotli/zstd only if
+# those libraries are present) and decompresses automatically. Advertising
+# "br" by hand would hand us undecodable bytes on a stock PyDroid 3 install.
 HEADERS = {
     "User-Agent": (
-        "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36"
+        "Mozilla/5.0 (Linux; Android 14; SM-S921B) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36"
     ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept": ("text/html,application/xhtml+xml,application/xml;q=0.9,"
+               "image/avif,image/webp,image/apng,*/*;q=0.8"),
     "Accept-Language": "en-US,en;q=0.9",
+    "Sec-Ch-Ua": '"Google Chrome";v="125", "Chromium";v="125", "Not.A/Brand";v="24"',
+    "Sec-Ch-Ua-Mobile": "?1",
+    "Sec-Ch-Ua-Platform": '"Android"',
+    "Upgrade-Insecure-Requests": "1",
 }
 
 JUNK_TAGS = [
@@ -184,37 +206,153 @@ def xml(s: str) -> str:
 
 
 # ----------------------------------------------------------------------------
-# SECTION 4 — Download
+# SECTION 4 — Download (shared retrying session + archive.today recovery)
 # ----------------------------------------------------------------------------
-def fetch_page(url: str, quiet: bool = False) -> tuple[str, str]:
-    """Download a page; return (html_text, final_url_after_redirects)."""
-    session = requests.Session()
-    session.headers.update(HEADERS)
-    try:
-        resp = session.get(url, timeout=TIMEOUT, allow_redirects=True)
-    except requests.exceptions.SSLError:
-        sys.exit("ERROR: SSL certificate problem on this site.")
-    except requests.exceptions.Timeout:
-        sys.exit(f"ERROR: the server did not respond within {TIMEOUT}s.")
-    except requests.exceptions.ConnectionError as exc:
-        sys.exit(f"ERROR: could not connect — {exc}")
+class FetchError(Exception):
+    """
+    A page could not be downloaded.
 
-    if resp.status_code in (401, 402, 403):
-        sys.exit(f"ERROR: HTTP {resp.status_code} — access refused "
-                 f"(hard paywall, login wall, or bot protection).")
+    `status`  = the HTTP status code, or None for a network-level failure.
+    `blocked` = True for paywall / login-wall / bot-protection / rate-limit
+                responses (401/402/403/429/451). resolve_article() treats a
+                `blocked` error as "worth retrying through archive.today"
+                rather than a hard stop.
+    """
+    def __init__(self, message: str, status=None, blocked: bool = False):
+        super().__init__(message)
+        self.status = status
+        self.blocked = blocked
+
+
+def _make_retry() -> Retry:
+    """Retry policy for transient failures. Handles the urllib3 kwarg rename
+       (allowed_methods in >=1.26, method_whitelist before that) so it works on
+       whatever urllib3 PyDroid 3 happens to bundle."""
+    base = dict(total=3, connect=3, read=3,
+                backoff_factor=0.8,                     # waits ~0.8s, 1.6s, 3.2s
+                status_forcelist=(429, 500, 502, 503, 504),
+                raise_on_status=False,
+                respect_retry_after_header=True)
+    try:
+        return Retry(allowed_methods=frozenset(["GET", "HEAD"]), **base)
+    except TypeError:
+        return Retry(method_whitelist=frozenset(["GET", "HEAD"]), **base)
+
+
+_SESSION = None
+
+
+def get_session() -> requests.Session:
+    """One shared Session for the whole run: Galaxy-S24 headers + auto-retry on
+       transient errors, reused for pages AND images (connection pooling)."""
+    global _SESSION
+    if _SESSION is None:
+        s = requests.Session()
+        s.headers.update(HEADERS)
+        adapter = HTTPAdapter(max_retries=_make_retry())
+        s.mount("https://", adapter)
+        s.mount("http://", adapter)
+        _SESSION = s
+    return _SESSION
+
+
+def _decode(resp) -> None:
+    """Pick a sane text encoding for the response, in place.
+
+    requests defaults to ISO-8859-1 (~cp1252) whenever the server sends no
+    charset — which mangles UTF-8 pages (curly quotes, accents, em-dashes).
+    So: trust an explicit charset from the Content-Type header, otherwise sniff
+    the actual bytes with apparent_encoding, and fall back to UTF-8.
+    """
+    ctype = (resp.headers.get("Content-Type") or "").lower()
+    if resp.encoding is None or "charset" not in ctype:
+        resp.encoding = resp.apparent_encoding or resp.encoding or "utf-8"
+
+
+def fetch_page(url: str, quiet: bool = False) -> "tuple[str, str]":
+    """
+    Download a page and return (html_text, final_url_after_redirects).
+
+    Raises FetchError on any failure (never sys.exit) so callers can react —
+    e.g. fall back to archive.today for a blocked page, or move on from a
+    failed AMP mirror. Transient errors are already retried by the session.
+    """
+    try:
+        resp = get_session().get(url, timeout=TIMEOUT, allow_redirects=True)
+    except requests.exceptions.SSLError as exc:
+        raise FetchError(f"SSL certificate problem on this site ({exc})") from exc
+    except requests.exceptions.Timeout as exc:
+        raise FetchError(f"no response within {TIMEOUT}s (after retries)") from exc
+    except requests.exceptions.ConnectionError as exc:
+        raise FetchError(f"could not connect — {exc}") from exc
+    except requests.exceptions.RequestException as exc:
+        raise FetchError(f"request failed — {exc}") from exc
+
+    if resp.status_code in (401, 402, 403, 451):
+        raise FetchError(
+            f"HTTP {resp.status_code} — access refused (paywall, login wall, "
+            f"or bot protection)", status=resp.status_code, blocked=True)
     if resp.status_code == 404:
-        sys.exit("ERROR: HTTP 404 — page not found. Check the URL.")
+        raise FetchError("HTTP 404 — page not found. Check the URL.", status=404)
+    if resp.status_code == 429:
+        raise FetchError("HTTP 429 — rate limited (retries exhausted)",
+                         status=429, blocked=True)
     if not resp.ok:
-        sys.exit(f"ERROR: HTTP {resp.status_code} {resp.reason}.")
+        raise FetchError(f"HTTP {resp.status_code} {resp.reason}.",
+                         status=resp.status_code)
 
     ctype = resp.headers.get("Content-Type", "")
     if "html" not in ctype and "xml" not in ctype:
-        sys.exit(f"ERROR: URL returned '{ctype}', not a web page.")
+        raise FetchError(f"URL returned '{ctype}', not a web page.")
 
-    resp.encoding = resp.apparent_encoding or resp.encoding
+    _decode(resp)
     if not quiet:
         print(f"[fetch] got {len(resp.text):,} characters of HTML.")
     return resp.text, resp.url
+
+
+# archive.today mirrors (same operator, different TLDs — we try each in turn).
+ARCHIVE_HOSTS = ("https://archive.ph", "https://archive.today", "https://archive.is")
+# Fingerprints of a Cloudflare "checking your browser" interstitial — a 200
+# response we must NOT mistake for a real archived article.
+_CF_CHALLENGE = ("just a moment", "checking your browser", "cf-browser-verification",
+                 "attention required", "enable javascript and cookies")
+
+
+def fetch_via_archive(url: str, quiet: bool = False) -> "tuple[str, str] | None":
+    """
+    Recover a soft-paywalled / JS-gated article from archive.today's public
+    snapshot. Returns (html, snapshot_url) or None.
+
+    HONEST CAVEAT: archive.today sits behind Cloudflare, which sometimes serves
+    an anti-bot JavaScript challenge instead of the snapshot. We can't solve
+    that challenge (no JS engine), so we detect it and give up cleanly rather
+    than feeding a "checking your browser" page into the extractor. It also
+    only helps SOFT paywalls that someone has already archived — it is not a
+    key to hard subscriber-only content.
+    """
+    for host in ARCHIVE_HOSTS:
+        snapshot = f"{host}/newest/{url}"
+        try:
+            resp = get_session().get(snapshot, timeout=TIMEOUT,
+                                     allow_redirects=True)
+        except requests.exceptions.RequestException:
+            continue                        # host down → try the next mirror
+        if resp.status_code != 200:
+            continue                        # 404 = nothing archived for this URL
+        _decode(resp)
+        text = resp.text
+        low = text[:4000].lower()
+        if any(sig in low for sig in _CF_CHALLENGE):
+            if not quiet:
+                print(f"[archive] {host} returned a Cloudflare challenge — skipping.")
+            continue
+        if len(text) < 2000:                # "no results" / stub page
+            continue
+        if not quiet:
+            print(f"[archive] recovered a snapshot via {host}")
+        return text, resp.url
+    return None
 
 
 # ----------------------------------------------------------------------------
@@ -487,8 +625,7 @@ def fetch_tweet(tweet_id: str) -> "dict | None":
         ),
     }
     try:
-        r = requests.get(TWEET_ENDPOINT, params=params, headers=HEADERS,
-                         timeout=TIMEOUT)
+        r = get_session().get(TWEET_ENDPOINT, params=params, timeout=TIMEOUT)
         r.raise_for_status()
         data = r.json()
     except Exception as exc:  # network error, non-200, or non-JSON body
@@ -623,6 +760,15 @@ def clean_soup(soup: BeautifulSoup) -> BeautifulSoup:
         ident = " ".join(tag.get("class") or []) + " " + (tag.get("id") or "") \
                 + " " + (tag.get("role") or "")
         if junk_re.search(ident):
+            # PROTECT REAL CONTENT from a false-positive keyword match. Some
+            # sites put a junk word right in the ARTICLE container's own class:
+            # Substack wraps every post in <article class="newsletter-post">,
+            # and "newsletter" is in JUNK_KEYWORDS — so the naive rule deleted
+            # the whole article (14k chars → 238). Genuine junk (nav, ads,
+            # share bars, cookie/subscribe widgets) is ALWAYS either small or
+            # mostly links, so we refuse to delete a big, link-sparse block.
+            if text_len(tag) > 300 and link_density(tag) < 0.5:
+                continue
             tag.decompose()
 
     # Strip inline styles/handlers and other presentational leftovers.
@@ -684,7 +830,7 @@ def collect_images(soup: BeautifulSoup, base_url: str) -> list[tuple[str, str, b
             img.attrs = {"src": seen[full_url], "alt": img.get("alt", "")}
             continue
         try:
-            r = requests.get(full_url, headers=HEADERS, timeout=TIMEOUT)
+            r = get_session().get(full_url, timeout=TIMEOUT)
             r.raise_for_status()
             data = r.content
             if not data or len(data) > MAX_IMAGE_BYTES:
@@ -914,8 +1060,25 @@ def resolve_article(url: str) -> "tuple[str, str, BeautifulSoup, str]":
 
     # --- Step 1: generic pipeline -----------------------------------------
     print(f"\n[fetch] downloading {url} ...")
-    html, final_url = fetch_page(url)
-    if final_url != url:
+    used_archive = False
+    try:
+        html, final_url = fetch_page(url)
+    except FetchError as exc:
+        # A blocked page (paywall/login/bot wall) is worth one archive.today
+        # attempt before we give up; any other error is a hard stop.
+        if exc.blocked:
+            print(f"[fetch] {exc}")
+            print("[archive] blocked — trying archive.today snapshot ...")
+            snap = fetch_via_archive(url)
+            if snap is None:
+                sys.exit(f"ERROR: {exc}\n"
+                         f"       No archive.today snapshot was available "
+                         f"either — this page needs a login or a real browser.")
+            html, final_url = snap
+            used_archive = True
+        else:
+            sys.exit(f"ERROR: {exc}")
+    if not used_archive and final_url != url:
         print(f"[fetch] redirected to {final_url}")
 
     full_soup = BeautifulSoup(html, PARSER)
@@ -925,7 +1088,7 @@ def resolve_article(url: str) -> "tuple[str, str, BeautifulSoup, str]":
     print(f"[meta ] title : {title}")
     print(f"[meta ] author: {author or '(not found)'}")
 
-    # Extraction fallback chain: scorer → JSON-LD → AMP → interactive.
+    # Extraction fallback chain: scorer → JSON-LD → AMP → archive → interactive.
     article = extract_main_content(full_soup)
     if article is None or text_len(article) < MIN_GOOD_TEXT:
         print("[extract] DOM scoring weak — trying JSON-LD articleBody ...")
@@ -946,8 +1109,28 @@ def resolve_article(url: str) -> "tuple[str, str, BeautifulSoup, str]":
                     article = amp_article
                     final_url = amp  # images now resolve against AMP
                     print("[extract] AMP version extracted successfully.")
-            except SystemExit:
+            except FetchError:
                 pass  # AMP fetch failed → keep going
+
+    # Soft-paywall / weak-extraction recovery via archive.today. Skipped when
+    # the page was ALREADY loaded from a snapshot at fetch time (no point
+    # re-fetching the same snapshot).
+    if (article is None or text_len(article) < MIN_GOOD_TEXT) and not used_archive:
+        print("[extract] still weak — trying archive.today snapshot ...")
+        snap = fetch_via_archive(url)
+        if snap is not None:
+            snap_html, snap_url = snap
+            snap_soup = BeautifulSoup(snap_html, PARSER)
+            snap_article = extract_main_content(snap_soup)
+            if snap_article is not None and text_len(snap_article) >= MIN_GOOD_TEXT:
+                article = snap_article
+                final_url = snap_url            # images resolve against snapshot
+                snap_ld = find_jsonld_article(snap_soup)
+                if title in ("", "Untitled Article"):
+                    title = detect_title(snap_soup, snap_ld)
+                if not author:
+                    author = detect_author(snap_soup, snap_ld)
+                print("[extract] recovered article from archive.today.")
 
     if article is None or text_len(article) < MIN_GOOD_TEXT:
         print("\n[!] Extraction looks WEAK (very little text found).")
