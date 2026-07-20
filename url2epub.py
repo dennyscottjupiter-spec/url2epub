@@ -1,41 +1,66 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-url2epub.py (v2) — Web article → Kindle-friendly EPUB, for PyDroid 3 on Android.
+url2epub.py (v2) — Web article -> Kindle-friendly EPUB3.
 
-WHY v2 EXISTS
+============================================================================
+ PLATFORM: ANDROID ONLY, via the PyDroid 3 app.  NOT for Windows/macOS/Linux.
+============================================================================
+  This script is written to run on an Android phone inside PyDroid 3
+  (the Python IDE from the Google Play Store). Every design decision below —
+  the zero-compiled-dependencies rule, the /storage/emulated/0/Download output
+  path, the Samsung Galaxy S24 request fingerprint, the runtime pip install —
+  exists because the target is a phone, not a desktop.
+
+  It will *technically* run under desktop CPython (handy for development), but
+  that is NOT a supported use: on a desktop the Download path doesn't exist so
+  the file lands in the current folder, and none of the Android conveniences
+  apply. Treat any desktop run as a test harness, not the product.
+
+WHY v2 EXISTS — THE ONE RULE YOU MUST NOT BREAK: no compiled dependencies.
   v1 depended on lxml (via readability-lxml and ebooklib). lxml is a COMPILED
   C extension: pip on Android tries to build it from source, needs libxml2/
-  libxslt dev headers that don't exist on the phone, and crashes. v2 removes
+  libxslt dev headers that do not exist on the phone, and crashes. v2 removes
   every compiled dependency:
 
-    * readability-lxml → replaced by a built-in pure-Python content scorer
-                          (same core idea: rank containers by text density
-                          and link density, keep the winner)
-    * ebooklib → replaced by a hand-rolled EPUB3 writer using only
-                          the standard library (an EPUB is just a ZIP with
-                          XML inside — see Section 10)
-    * lxml parser → replaced by Python's built-in "html.parser"
+    * readability-lxml -> a built-in pure-Python content scorer (Section 6):
+                          rank containers by text density and link density,
+                          keep the winner (Reader-Mode heuristics).
+    * ebooklib        -> a hand-rolled EPUB3 writer using only the standard
+                          library (an EPUB is just a ZIP full of XML — Sec 10).
+    * lxml parser     -> Python's built-in "html.parser".
 
-  Remaining pip deps: requests + beautifulsoup4. Both are PURE PYTHON, so
-  auto-install on Android cannot hit a compiler.
+  The ONLY two pip deps are requests + beautifulsoup4. Both are PURE PYTHON,
+  so the runtime auto-install (Section 1) can never hit a compiler. If a future
+  change seems to need lxml / Pillow / ebooklib / a JS engine, solve it with
+  the stdlib or a pure-Python approach instead — do NOT add the dependency.
 
-EXTRACTION PIPELINE (handles JS-heavy sites better than v1)
-  1. Score-based main-content extraction (Reader-Mode style).
-  2. If weak → JSON-LD fallback: many JavaScript-rendered sites still ship
-     the FULL article text inside <script type="application/ld+json">
-     metadata for SEO. We mine it.
-  3. If weak → AMP fallback: refetch the page's AMP version
-     (<link rel="amphtml">), which is server-rendered plain HTML.
-  4. If still weak → interactive choice: full cleaned page body, or abort.
+HOW A URL BECOMES AN ARTICLE (resolve_article, Section 12)
+  0. SPECIAL-SITE handlers first (Section 6B). Sites that never expose their
+     text to a plain, JavaScript-free fetch get a dedicated extractor:
+       * X / Twitter -> X's public "syndication" JSON API (no login, no JS).
+  1. GENERIC pipeline — fetch the page (Galaxy-S24 headers + auto-retry),
+     read its metadata, then a five-stage extraction fallback chain:
+       a. Reader-Mode DOM scorer (Section 6).
+       b. JSON-LD articleBody: JS-rendered sites often ship the FULL text
+          inside <script type="application/ld+json"> for SEO — we mine it.
+       c. AMP mirror (<link rel="amphtml">): server-rendered plain HTML.
+       d. archive.today snapshot: recovers many SOFT paywalls / JS-gated
+          pages (best-effort; it is rate-limited and won't beat hard paywalls).
+       e. Interactive choice: use the full cleaned page body, or abort.
 
-  Hard limit (honest disclosure): pages that ONLY exist after executing
-  JavaScript cannot be captured without a real browser engine, which
-  PyDroid 3 cannot run.
+  Hard limit (honest disclosure): pages whose text exists ONLY after running
+  JavaScript, and hard subscriber-only paywalls, cannot be captured — that
+  needs a real browser engine, which PyDroid 3 cannot run.
 
 OUTPUT
-  /storage/emulated/0/Download/<Article_Title>.epub
-  (falls back to the script's folder if storage permission is missing)
+  /storage/emulated/0/Download/<Article_Title>.epub   (the phone's Downloads)
+  Falls back to the current folder if that path isn't writable (e.g. on a
+  desktop, or before granting PyDroid 3 the Storage permission).
+
+USAGE (on the phone): open in PyDroid 3, press the yellow ▶ Run button, paste
+  the article URL when prompted. Then open the .epub with a reader / "Send to
+  Kindle". The script is interactive (stdin) and takes no command-line args.
 """
 
 # ----------------------------------------------------------------------------
@@ -1151,6 +1176,9 @@ def resolve_article(url: str) -> "tuple[str, str, BeautifulSoup, str]":
 
 
 def main() -> None:
+    """Interactive entry point: prompt for a URL, resolve it to an article
+       (Section 12's resolve_article), then build and write the .epub —
+       download images, split into chapters, and serialize the EPUB3 ZIP."""
     print("=" * 60)
     print(" url2epub v2 — turn any article into a Kindle EPUB")
     print("=" * 60)
