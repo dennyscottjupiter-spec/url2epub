@@ -329,7 +329,7 @@ def score_container(tag) -> float:
         score += min(len(t) / 100.0, 3.0) # cap so one huge <p> can't dominate
         score += t.count(",") * 0.5
 
-    ident = " ".join(tag.get("class", [])) + " " + (tag.get("id") or "")
+    ident = " ".join(tag.get("class") or []) + " " + (tag.get("id") or "")
     if POSITIVE_HINTS.search(ident) or tag.name in ("article", "main"):
         score *= 1.4
     if NEGATIVE_HINTS.search(ident):
@@ -398,9 +398,24 @@ def clean_soup(soup: BeautifulSoup) -> BeautifulSoup:
 
     junk_re = re.compile("|".join(re.escape(k) for k in JUNK_KEYWORDS), re.I)
     for tag in soup.find_all(True):
+        # CRITICAL — skip already-decomposed nodes (see the bug note below).
+        # find_all() captured a STATIC snapshot of every tag before we began
+        # deleting. When we decompose() a junk container in this loop, bs4
+        # >= 4.13 nulls out .attrs (and .name) on that node AND every one of
+        # its descendants. Those dead descendants are still sitting in our
+        # snapshot, so when the loop later reaches one, `tag.get(...)` becomes
+        # `None.get(...)` and raises:
+        #     AttributeError: 'NoneType' object has no attribute 'get'
+        # This is the real cause of the "crashes on Wikipedia" bug. Note the
+        # once-suggested `tag.get("class") or []` does NOT fix it — it still
+        # dereferences the None .attrs. Skipping decomposed nodes is the fix.
+        # getattr(..., False) keeps this a no-op on the OLDER bs4 bundled with
+        # PyDroid 3 (which lacks .decomposed and never had the crash anyway).
+        if getattr(tag, "decomposed", False):
+            continue
         if tag.name in ("html", "body"):
             continue
-        ident = " ".join(tag.get("class", [])) + " " + (tag.get("id") or "") \
+        ident = " ".join(tag.get("class") or []) + " " + (tag.get("id") or "") \
                 + " " + (tag.get("role") or "")
         if junk_re.search(ident):
             tag.decompose()
