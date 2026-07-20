@@ -8,6 +8,10 @@ A single self-contained Python script (`url2epub.py`) that turns a web article U
 Kindle-friendly EPUB3. There is no package, no build, no dependency manifest, and no test
 suite — the whole program is one file.
 
+**It runs on Android only, inside the [PyDroid 3](https://play.google.com/store/apps/details?id=ru.iiec.pydroid3)
+app — not Windows/macOS/Linux.** Desktop CPython works and is how the tool is developed and
+tested, but that is *not* a supported use (see "Running it").
+
 ## The overriding design constraint: zero compiled dependencies
 
 This is the single most important thing to know before changing anything. The tool is built
@@ -50,15 +54,25 @@ python3 -c "import subprocess; subprocess.run(['python3','url2epub.py'], input='
 
 The file is organized top-to-bottom into numbered `SECTION 0…12` comment banners that follow
 the runtime pipeline order. Keep that structure: put new code in the matching section and keep
-the helper functions pure. `main()` (Section 12) orchestrates everything; the interesting logic
-is the extraction fallback chain it drives:
+the helper functions pure. `resolve_article()` (Section 12) turns a URL into
+`(title, author, article_soup, base_url)`; `main()` then builds the EPUB from that. The
+interesting logic is the extraction fallback chain `resolve_article` drives:
 
-1. **Fetch** (Section 4) — one `requests` GET with a mobile User-Agent; hard-exits on paywall
-   /404/non-HTML.
+0. **Special-site handlers** (Section 6B) run FIRST, before the generic pipeline — for sites
+   that never expose text to a JavaScript-free fetch. Currently **X / Twitter**:
+   `tweet_to_article()` pulls the post from X's public syndication JSON API
+   (`cdn.syndication.twimg.com/tweet-result`, no login/JS), including media and quoted tweets;
+   `_tweet_token()` reproduces X's base36 token. Add future per-site handlers here — each returns
+   the same `{title, author, article, base_url}` dict, or `None` to fall through.
+1. **Fetch** (Section 4) — a shared `requests.Session` (`get_session()`) with a **Samsung Galaxy
+   S24** fingerprint + Sec-CH-UA client hints and automatic **retry/backoff** (HTTPAdapter +
+   urllib3 Retry) on 429/5xx. `fetch_page()` **raises `FetchError`** (it no longer `sys.exit()`s)
+   so callers can react — a `blocked` error triggers the archive.today fallback; `_decode()`
+   fixes requests' cp1252-default mangling of UTF-8.
 2. **Metadata** (Section 5) — title/author, mining `<script type="application/ld+json">`
    structured data first, then `og:`/meta tags, then visible DOM.
-3. **Extraction — a 4-stage fallback chain** (Section 6, sequenced in `main()`). Each stage is
-   accepted only if it yields ≥ `MIN_GOOD_TEXT` (500) chars, else it falls through to the next:
+3. **Extraction — a 5-stage fallback chain** (Section 6). Each stage is accepted only if it
+   yields ≥ `MIN_GOOD_TEXT` (500) chars, else it falls through to the next:
    1. **Score-based DOM extraction** (`extract_main_content` → `score_container`): Reader-Mode
       heuristics — reward long paragraphs and comma counts, weight by `POSITIVE_HINTS`
       /`NEGATIVE_HINTS` class/id names, and multiply down by link density. Then climb parents
@@ -66,10 +80,16 @@ is the extraction fallback chain it drives:
    2. **JSON-LD `articleBody`** — JS-rendered sites often ship the full text here for SEO even
       when the visible DOM is empty.
    3. **AMP** — refetch the `<link rel="amphtml">` version (server-rendered plain HTML).
-   4. **Interactive** — offer the full cleaned page body, or abort.
+   4. **archive.today** (`fetch_via_archive()`) — on a blocked page (401/402/403/429/451) or
+      still-weak extraction, try the public archive.ph/today/is snapshot. Best-effort: detects
+      Cloudflare/rate-limit responses and returns `None` gracefully (won't beat hard paywalls).
+   5. **Interactive** — offer the full cleaned page body, or abort.
 4. **Cleanup** (`clean_soup`, Section 7) — strips `JUNK_TAGS`, elements whose class/id/role
    match `JUNK_KEYWORDS`, inline styles/handlers, and empties. Note `JUNK_KEYWORDS` *deletes*
    nodes, while `POSITIVE_HINTS`/`NEGATIVE_HINTS` only *score* them — don't conflate the two.
+   **Guard:** `clean_soup` refuses to delete a *large, link-sparse* block even if a junk keyword
+   matches its class — this protects e.g. Substack's `<article class="newsletter-post">` from
+   being wiped by the `newsletter` keyword.
 5. **Images** (Section 8) — download + embed each `<img>` as an internal EPUB path, resolving
    lazy-load attributes (`data-src`, `srcset`, …); failed/oversized images are dropped.
 6. **Chapters** (Section 9) — inject an invisible marker before every `h1`/`h2`, serialize,
@@ -83,12 +103,22 @@ is the extraction fallback chain it drives:
    strings pass through `xml()`.
 
 Tuning knobs are the module constants in **Section 2** (`OUTPUT_DIR`, `TIMEOUT`,
-`MAX_IMAGE_BYTES`, `MIN_GOOD_TEXT`, `HEADERS`, and the junk/hint lists).
+`MAX_IMAGE_BYTES`, `MIN_GOOD_TEXT`, `HEADERS` — now a Galaxy S24 fingerprint — and the
+junk/hint lists), plus `ARCHIVE_HOSTS` (Section 4) and `TWEET_URL_RE` (Section 6B).
 
-## Known compatibility gotcha
+## Known compatibility gotcha (bs4 ≥ 4.13 crash — the REAL cause)
 
-The script targets the older BeautifulSoup that ships with PyDroid 3. On **bs4 ≥ 4.13**
-(e.g. 4.15 on this dev machine) `Tag.attrs` can be `None`, so the `tag.get("class", [])` calls
-in `clean_soup`/`score_container` raise `AttributeError: 'NoneType' object has no attribute 'get'`
-on many real pages (Wikipedia, etc.). The safe idiom on modern bs4 is `tag.get("class") or []`.
-Keep this in mind when testing on desktop — a crash there may be this version skew, not the site.
+The script targets the older BeautifulSoup PyDroid 3 ships, but must not crash on newer bs4
+(e.g. 4.15 on this dev machine). The "crashes on Wikipedia" bug:
+
+`clean_soup` iterates a **static** `find_all(True)` snapshot and `decompose()`s junk containers
+mid-loop. On **bs4 ≥ 4.13**, `decompose()` nulls out `.attrs` (and `.name`) on the node **and all
+its descendants**. Those dead descendants are still in the snapshot, so when the loop reaches one,
+`tag.get(...)` becomes `None.get(...)` → `AttributeError: 'NoneType' object has no attribute 'get'`.
+
+**The fix is to SKIP already-decomposed nodes**: `if getattr(tag, "decomposed", False): continue`
+at the top of the loop (a harmless no-op on the older bs4, which never had the crash). ⚠️ The
+once-suggested `tag.get("class") or []` does **NOT** fix this — it still dereferences the `None`
+`.attrs`. (We do use `tag.get("class") or []` defensively, but the decomposed-guard is what
+actually prevents the crash.) Keep this in mind when testing on desktop — a crash there may be
+this version skew, not the site.
