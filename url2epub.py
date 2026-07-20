@@ -389,6 +389,211 @@ def find_amp_url(full_soup: BeautifulSoup, base_url: str) -> str:
 
 
 # ----------------------------------------------------------------------------
+# SECTION 6B — Special-site handler: X / Twitter (the "it doesn't work" case)
+# ----------------------------------------------------------------------------
+# WHY THIS EXISTS
+#   x.com / twitter.com is a login-gated JavaScript single-page app. A plain
+#   GET (all this tool can do — PyDroid 3 has no browser engine to run JS)
+#   returns an almost-empty HTML shell with NO tweet text in it, so the
+#   Reader-Mode scorer in Section 6 finds nothing. That is *why* pasting an X
+#   link used to fail completely.
+#
+#   THE TRICK: X still runs a public, unauthenticated "syndication" service
+#   that powers embedded tweets on third-party websites. Given a tweet id it
+#   returns the whole tweet as clean JSON — text, author, media, and any
+#   quoted tweet — with NO login and NO JavaScript required:
+#
+#       https://cdn.syndication.twimg.com/tweet-result?id=<ID>&lang=en&token=<T>
+#
+#   The endpoint requires *some* non-empty `token` query param (an absent or
+#   empty token just returns "{}"). The token is derived from the tweet id with
+#   the same tiny formula X's own front-end uses — see _tweet_token(). We
+#   verified empirically that the server does not actually re-check the
+#   derivation (any non-empty token is accepted today), but we compute it
+#   correctly anyway so the tool keeps working if X starts validating it.
+#
+# SCOPE (honest disclosure): this captures ONE tweet — plus its quoted tweet
+#   and all attached photos/video posters. The public endpoint does NOT return
+#   the downstream replies of a self-thread, so a multi-tweet thread collapses
+#   to its first tweet. Whole profiles and timelines remain out of scope: those
+#   genuinely require an authenticated, JavaScript-capable browser.
+
+# A tweet URL is .../<user>/status/<digits> on x.com, twitter.com, the old
+# mobile.twitter.com, or nitter-style mirrors. Capture the numeric status id.
+TWEET_URL_RE = re.compile(
+    r"^https?://(?:[\w.-]+\.)?(?:twitter|x)\.com/[^/]+/status(?:es)?/(\d+)",
+    re.IGNORECASE)
+
+TWEET_ENDPOINT = "https://cdn.syndication.twimg.com/tweet-result"
+_B36_DIGITS = "0123456789abcdefghijklmnopqrstuvwxyz"
+
+
+def _js_number_to_base36(x: float) -> str:
+    """
+    Port of JavaScript's Number.prototype.toString(36) for a positive float.
+    X's front-end builds the token as ((id / 1e15) * Math.PI).toString(36),
+    and JavaScript renders the FRACTIONAL part in base 36 too — Python has no
+    built-in that does that, so we reproduce it digit by digit.
+    """
+    if x <= 0:
+        return "0"
+    int_part = int(x)
+    frac = x - int_part
+    if int_part == 0:
+        out = "0"
+    else:
+        out, n = "", int_part
+        while n > 0:
+            out = _B36_DIGITS[n % 36] + out
+            n //= 36
+    if frac == 0:
+        return out
+    out += "."
+    # 30 base-36 fractional digits is far more than a float can distinguish;
+    # we stop early once the fraction is exhausted.
+    for _ in range(30):
+        frac *= 36
+        digit = int(frac)
+        out += _B36_DIGITS[digit]
+        frac -= digit
+        if frac == 0:
+            break
+    return out
+
+
+def _tweet_token(tweet_id: str) -> str:
+    """X's syndication token: base36 of (id / 1e15 * pi), with 0s and '.' removed."""
+    value = (int(tweet_id) / 1e15) * 3.141592653589793
+    return re.sub(r"0+|\.", "", _js_number_to_base36(value))
+
+
+def is_tweet_url(url: str) -> bool:
+    """True if this URL points at a single tweet/post we can special-case."""
+    return bool(TWEET_URL_RE.match(url))
+
+
+def fetch_tweet(tweet_id: str) -> "dict | None":
+    """Call the public syndication endpoint; return the tweet dict, or None."""
+    params = {
+        "id": tweet_id,
+        "lang": "en",
+        "token": _tweet_token(tweet_id),
+        # The features string is what X's own embed widget sends; the endpoint
+        # ignores unknown flags, so this is harmless but keeps us embed-like.
+        "features": (
+            "tfw_timeline_list:;tfw_follower_count_sunset:true;"
+            "tfw_tweet_edit_backend:on;tfw_refsrc_session:on;"
+            "tfw_show_business_verified_badge:on;"
+        ),
+    }
+    try:
+        r = requests.get(TWEET_ENDPOINT, params=params, headers=HEADERS,
+                         timeout=TIMEOUT)
+        r.raise_for_status()
+        data = r.json()
+    except Exception as exc:  # network error, non-200, or non-JSON body
+        print(f"[x] syndication request failed: {exc}")
+        return None
+    if not isinstance(data, dict) or data.get("__typename") == "TweetTombstone":
+        print("[x] tweet unavailable (deleted, protected, or age-restricted).")
+        return None
+    if not (data.get("text") or data.get("mediaDetails")):
+        print("[x] syndication returned no usable tweet content.")
+        return None
+    return data
+
+
+def _expand_tweet_text(data: dict) -> str:
+    """
+    Replace t.co shortlinks with their readable display URLs and strip the
+    auto-appended trailing media shortlink. Returns plain (un-escaped) text.
+    """
+    text = data.get("text") or ""
+    for u in (data.get("entities") or {}).get("urls", []) or []:
+        short = u.get("url")
+        shown = u.get("display_url") or u.get("expanded_url")
+        if short and shown:
+            text = text.replace(short, shown)
+    # Any leftover t.co link is the media link X appends to the text → drop it.
+    return re.sub(r"https?://t\.co/\w+", "", text).strip()
+
+
+def _tweet_media_html(data: dict) -> str:
+    """<img> tags (as an HTML string) for a tweet's photos and video posters."""
+    html = ""
+    for m in data.get("mediaDetails") or []:
+        src = m.get("media_url_https") or m.get("media_url")
+        if not src:
+            continue
+        kind = m.get("type", "photo")
+        # An EPUB is static, so a video/GIF can only show its poster frame.
+        note = "" if kind == "photo" else (
+            f"<p class='meta'>[{xml(kind.replace('_', ' '))} — poster frame; "
+            f"open on X to watch]</p>")
+        html += f'<img src="{xml(src)}" alt="tweet media"/>{note}'
+    return html
+
+
+def _render_tweet_block(data: dict) -> str:
+    """One tweet → HTML paragraphs + media (no heading; used for main & quote)."""
+    text = _expand_tweet_text(data)
+    paras = "".join(f"<p>{xml(p)}</p>"
+                    for p in re.split(r"\n{1,}", text) if p.strip())
+    return paras + _tweet_media_html(data)
+
+
+def tweet_to_article(url: str) -> "dict | None":
+    """
+    Turn an x.com/twitter.com tweet URL into the same shape the generic
+    pipeline produces: {title, author, article(BeautifulSoup), base_url}.
+    Returns None if this isn't a tweet URL or the fetch fails (so main() can
+    fall back to the normal pipeline — e.g. for a twitter.com *blog* link).
+    """
+    m = TWEET_URL_RE.match(url)
+    if not m:
+        return None
+    tweet_id = m.group(1)
+    print(f"[x] detected a tweet (id {tweet_id}); using X's public syndication "
+          f"API — no login, no JavaScript needed ...")
+    data = fetch_tweet(tweet_id)
+    if data is None:
+        return None
+
+    user = data.get("user") or {}
+    name = (user.get("name") or "").strip()
+    handle = (user.get("screen_name") or "").strip()
+    author = f"{name} (@{handle})" if name and handle else (name or handle or "X")
+
+    text = _expand_tweet_text(data)
+    when = ""
+    created = data.get("created_at") or ""
+    try:  # ISO 8601 → "07 November 2012"
+        when = time.strftime("%d %B %Y", time.strptime(created[:19],
+                                                        "%Y-%m-%dT%H:%M:%S"))
+    except Exception:
+        pass
+
+    slug = re.sub(r"\s+", " ", text)[:60].strip()
+    title = f"{name or handle} on X - {slug}" if slug else f"{author} on X"
+
+    body = f"<h1>{xml(author)}</h1>" + _render_tweet_block(data)
+
+    quoted = data.get("quoted_tweet")
+    if isinstance(quoted, dict):
+        q_user = quoted.get("user") or {}
+        q_author = (f"{q_user.get('name', '')} "
+                    f"(@{q_user.get('screen_name', '')})").strip()
+        body += (f"<blockquote><p class='meta'>Quoting {xml(q_author)}:</p>"
+                 f"{_render_tweet_block(quoted)}</blockquote>")
+
+    meta = f"— {xml(author)}" + (f", {when}" if when else "")
+    body += f"<p class='meta'>{meta} · source: {xml(url)}</p>"
+
+    return {"title": title, "author": author,
+            "article": BeautifulSoup(body, PARSER), "base_url": url}
+
+
+# ----------------------------------------------------------------------------
 # SECTION 7 — Junk removal
 # ----------------------------------------------------------------------------
 def clean_soup(soup: BeautifulSoup) -> BeautifulSoup:
@@ -683,16 +888,31 @@ def resolve_output_path(filename: str) -> str:
 # ----------------------------------------------------------------------------
 # SECTION 12 — Main program flow
 # ----------------------------------------------------------------------------
-def main() -> None:
-    print("=" * 60)
-    print(" url2epub v2 — turn any article into a Kindle EPUB")
-    print("=" * 60)
+def resolve_article(url: str) -> "tuple[str, str, BeautifulSoup, str]":
+    """
+    Turn a URL into (title, author, article_soup, base_url_for_images).
 
-    try:
-        url = normalize_url(input("\nPaste the article URL: "))
-    except ValueError as exc:
-        sys.exit(f"ERROR: {exc}")
+    Order of attack:
+      0. SPECIAL-SITE handlers (currently X/Twitter). Sites that never expose
+         their text to a non-JavaScript fetch get their own dedicated extractor
+         and skip the generic pipeline entirely.
+      1. GENERIC pipeline — fetch the page, read its metadata, then run the
+         four-stage extraction fallback chain from Section 6:
+             Reader-Mode scorer → JSON-LD articleBody → AMP mirror
+             → interactive (full cleaned page body, or abort).
+    """
+    # --- Step 0: special-site handlers ------------------------------------
+    # Add future per-site handlers here (each returns the same dict or None).
+    special = tweet_to_article(url)          # None for any non-tweet URL
+    if special is not None:
+        print(f"[meta ] title : {special['title']}")
+        print(f"[meta ] author: {special['author'] or '(not found)'}")
+        print(f"[x    ] tweet captured: "
+              f"{text_len(special['article']):,} characters.")
+        return (special["title"], special["author"],
+                special["article"], special["base_url"])
 
+    # --- Step 1: generic pipeline -----------------------------------------
     print(f"\n[fetch] downloading {url} ...")
     html, final_url = fetch_page(url)
     if final_url != url:
@@ -705,7 +925,7 @@ def main() -> None:
     print(f"[meta ] title : {title}")
     print(f"[meta ] author: {author or '(not found)'}")
 
-    # --- Extraction pipeline: scorer → JSON-LD → AMP → interactive ----------
+    # Extraction fallback chain: scorer → JSON-LD → AMP → interactive.
     article = extract_main_content(full_soup)
     if article is None or text_len(article) < MIN_GOOD_TEXT:
         print("[extract] DOM scoring weak — trying JSON-LD articleBody ...")
@@ -724,14 +944,14 @@ def main() -> None:
                 if amp_article is not None and \
                         text_len(amp_article) >= MIN_GOOD_TEXT:
                     article = amp_article
-                    final_url = amp # images now resolve against AMP
+                    final_url = amp  # images now resolve against AMP
                     print("[extract] AMP version extracted successfully.")
             except SystemExit:
-                pass # AMP fetch failed → keep going
+                pass  # AMP fetch failed → keep going
 
     if article is None or text_len(article) < MIN_GOOD_TEXT:
         print("\n[!] Extraction looks WEAK (very little text found).")
-        print(" Possible causes: JavaScript-only site, paywall, odd layout.")
+        print("    Possible causes: JavaScript-only site, paywall, odd layout.")
         print("\n 1) Use the FULL cleaned page body instead (may include clutter)")
         print(" 2) Abort")
         if input(" Choose 1 or 2: ").strip() == "1":
@@ -744,6 +964,20 @@ def main() -> None:
             sys.exit("Aborted by user.")
 
     print(f"[extract] clean article text: {text_len(article):,} characters.")
+    return title, author, article, final_url
+
+
+def main() -> None:
+    print("=" * 60)
+    print(" url2epub v2 — turn any article into a Kindle EPUB")
+    print("=" * 60)
+
+    try:
+        url = normalize_url(input("\nPaste the article URL: "))
+    except ValueError as exc:
+        sys.exit(f"ERROR: {exc}")
+
+    title, author, article, final_url = resolve_article(url)
 
     # --- Build ---------------------------------------------------------------
     print("\n[build] downloading images ...")
