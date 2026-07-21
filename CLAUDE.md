@@ -72,7 +72,11 @@ through to the next handler and then the generic pipeline.
   `_draftjs_to_html()`. **Quirk:** X sends inline style names TitleCase (`"Bold"`), not Draft.js's
   `"BOLD"` — matched case-insensitively. **Fragility:** everything but the doc_id lookup is a fixed
   point that breaks silently if X changes its obfuscation or schema; no self-healing short of a new
-  `xclienttransaction` release or a manual fix — on any failure it returns `None` and falls through.
+  `xclienttransaction` release or a manual fix. **Reliability:** *transient* failures (esp. a 429
+  when X rate-limits guest activation — the actual cause of the "blank EPUB" bug) are retried with
+  backoff (`_ARTICLE_ATTEMPTS`, `_article_once` raises `_ArticleTransient`); a *definitive* miss
+  returns `None` at once. On a final `None` for a recognized X URL, `resolve_article()` **exits with
+  a clear "try again" message** rather than emitting a junk near-empty EPUB from the generic pipeline.
 
 **1. Fetch** (S4) — a shared `requests.Session` (`get_session()`) with a **Samsung Galaxy S24**
 fingerprint + Sec-CH-UA hints and auto retry/backoff (HTTPAdapter + urllib3 Retry) on 429/5xx.

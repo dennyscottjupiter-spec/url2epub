@@ -683,9 +683,12 @@ def tweet_to_article(url: str) -> "dict | None":
 # HONEST DISCLOSURE: every piece above except the doc_id lookup is a fixed
 # point that breaks the moment X reshuffles its obfuscation or GraphQL
 # schema, with no way for this script to self-heal — only a new release of
-# `xclienttransaction` (or a manual fix here) can. On any failure this
-# returns None and resolve_article() falls back to the generic pipeline,
-# same as every other stage in this file.
+# `xclienttransaction` (or a manual fix here) can. TRANSIENT failures (the
+# common one: a 429 when X rate-limits guest activation) are retried with
+# backoff (_ARTICLE_ATTEMPTS); a definitive miss returns None at once. When it
+# ultimately returns None for a recognised X URL, resolve_article() does NOT
+# fall through to the generic pipeline (that only yields a junk near-empty
+# EPUB for X's JS-only shell) — it exits with a clear "try again" message.
 
 ARTICLE_URL_RE = re.compile(
     r"^https?://(?:[\w.-]+\.)?x\.com/(?:[^/]+/article|i/article)/(\d+)",
@@ -738,6 +741,9 @@ def _x_guest_client() -> "tuple[requests.Session, ClientTransaction] | None":
        unrelated requests made later in the same run."""
     s = requests.Session()
     s.headers.update(HEADERS)
+    adapter = HTTPAdapter(max_retries=_make_retry())   # same 429/5xx backoff as get_session()
+    s.mount("https://", adapter)
+    s.mount("http://", adapter)
     try:
         home = s.get("https://x.com/home", timeout=TIMEOUT)
         home_soup = BeautifulSoup(home.content, PARSER)
@@ -849,21 +855,24 @@ def _draftjs_to_html(content_state: dict) -> str:
     return "".join(html)
 
 
-def article_to_article(url: str) -> "dict | None":
-    """Turn an x.com Article URL into {title, author, article, base_url} —
-       same shape tweet_to_article() produces. None on any failure, so
-       resolve_article() falls back to the generic pipeline."""
-    m = ARTICLE_URL_RE.match(url)
-    if not m:
-        return None
-    tweet_id = m.group(1)
-    print(f"[article] detected an X Article (tweet id {tweet_id}); "
-          f"using X's internal GraphQL API — this is the fragile path, "
-          f"see Section 6C ...")
+class _ArticleTransient(Exception):
+    """A retryable failure of the X Article path — a network blip, a rate-limit
+       (429 on guest activation is common), or a transient GraphQL error. Raised
+       by one attempt so article_to_article() can back off and try again, as
+       opposed to a *definitive* miss (deleted/subscriber-only) which returns
+       None straight away and must NOT be retried."""
 
+
+_ARTICLE_ATTEMPTS = 3   # X rate-limits guest access hard; a couple of retries with backoff clears it
+
+
+def _article_once(url: str, tweet_id: str) -> "dict | None":
+    """One full X-Article fetch attempt. Returns the built dict on success,
+       None if the id definitively has no readable article, or raises
+       _ArticleTransient for a failure worth retrying."""
     client = _x_guest_client()
     if client is None:
-        return None
+        raise _ArticleTransient("could not establish an X guest session")
     s, ct = client
 
     data = _gql_get(s, ct, "TweetResultByRestId", {
@@ -871,9 +880,15 @@ def article_to_article(url: str) -> "dict | None":
         "includePromotedContent": False, "withVoice": False,
     }, field_toggles=_ARTICLE_FIELD_TOGGLES)
     if data is None:
-        return None
+        raise _ArticleTransient("GraphQL request failed (HTTP error or rate limit)")
 
     tweet = (data.get("data") or {}).get("tweetResult", {}).get("result", {}) or {}
+    if not tweet and data.get("errors"):
+        # No result at all + an errors array => usually a rate-limit/auth blip,
+        # not a genuinely article-less tweet. Worth another attempt.
+        raise _ArticleTransient(
+            f"X returned an error: {data['errors'][0].get('message', 'unknown')}")
+
     art = ((tweet.get("article") or {}).get("article_results") or {}).get("result")
     if not art:
         print("[article] no article content on that id — may be deleted, "
@@ -898,6 +913,35 @@ def article_to_article(url: str) -> "dict | None":
     print(f"[article] captured '{title}' — {n_blocks} block(s).")
     return {"title": title, "author": author,
             "article": BeautifulSoup(body, PARSER), "base_url": url}
+
+
+def article_to_article(url: str) -> "dict | None":
+    """Turn an x.com Article URL into {title, author, article, base_url} —
+       same shape tweet_to_article() produces. Retries transient failures
+       (X's guest API rate-limits aggressively) with backoff; returns None
+       only on a definitive miss or after all attempts are exhausted, so
+       resolve_article() can then react (see there — it no longer silently
+       emits an empty EPUB for a recognised X URL)."""
+    m = ARTICLE_URL_RE.match(url)
+    if not m:
+        return None
+    tweet_id = m.group(1)
+    print(f"[article] detected an X Article (tweet id {tweet_id}); "
+          f"using X's internal GraphQL API — this is the fragile path, "
+          f"see Section 6C ...")
+
+    for attempt in range(1, _ARTICLE_ATTEMPTS + 1):
+        try:
+            return _article_once(url, tweet_id)     # dict on success, None if definitively no article
+        except _ArticleTransient as exc:
+            if attempt < _ARTICLE_ATTEMPTS:
+                wait = 1.5 * attempt                # ~1.5s, 3s — lets X's rate limiter reset
+                print(f"[article] {exc} — retrying in {wait:.0f}s "
+                      f"(attempt {attempt + 1}/{_ARTICLE_ATTEMPTS}) ...")
+                time.sleep(wait)
+            else:
+                print(f"[article] gave up after {_ARTICLE_ATTEMPTS} attempts: {exc}")
+    return None
 
 
 # ----------------------------------------------------------------------------
@@ -1184,6 +1228,16 @@ def resolve_article(url: str) -> "tuple[str, str, BeautifulSoup, str]":
         print(f"[x    ] captured {text_len(special['article']):,} characters.")
         return (special["title"], special["author"],
                 special["article"], special["base_url"])
+
+    # A recognised X post/article whose handler came back empty will NEVER
+    # extract via the generic pipeline (X serves a JS-only shell), so falling
+    # through would just emit a misleading near-empty EPUB. Fail loudly instead.
+    if is_tweet_url(url) or is_article_url(url):
+        sys.exit(
+            "ERROR: this is an X/Twitter post, but X's internal API could not be\n"
+            "       reached — it rate-limits guest access hard. The generic reader\n"
+            "       cannot read X's JavaScript-only pages, so no usable EPUB would\n"
+            "       be produced. Wait ~a minute and try again; the limit resets fast.")
 
     # --- Step 1: generic pipeline -----------------------------------------
     print(f"\n[fetch] downloading {url} ...")
