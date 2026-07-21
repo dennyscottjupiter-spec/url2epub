@@ -8,15 +8,17 @@ CPython too, but only as a dev harness (Download path falls back to cwd).
 
 Zero-compiled-dependencies rule: v1 used lxml (readability-lxml, ebooklib),
 which fails to compile on Android. v2 replaces all of it with pure Python —
-content scorer (Sec 6), hand-rolled EPUB writer (Sec 10), html.parser. Only
-deps are requests + beautifulsoup4 (pure Python, auto-installed by Sec 1).
-Never add a compiled dependency (lxml/Pillow/ebooklib/a JS engine).
+content scorer (Sec 6), hand-rolled EPUB writer (Sec 10), html.parser. Deps
+are requests + beautifulsoup4 + xclienttransaction (all pure Python,
+auto-installed by Sec 1; the 3rd is a deliberate, documented exception for
+X Articles support only — see Sec 6C). Never add a compiled dependency
+(lxml/Pillow/ebooklib/a JS engine).
 
-Pipeline (resolve_article, Sec 12): special-site handlers first (Sec 6B —
-currently X/Twitter), else generic fetch + 5-stage extraction fallback
-(DOM scorer -> JSON-LD articleBody -> AMP mirror -> archive.today ->
-interactive full-page choice). Pages needing JS or a hard paywall can't be
-captured — no browser engine on PyDroid 3.
+Pipeline (resolve_article, Sec 12): special-site handlers first (Sec 6B
+X/Twitter, Sec 6C X Articles), else generic fetch + 5-stage extraction
+fallback (DOM scorer -> JSON-LD articleBody -> AMP mirror -> archive.today
+-> interactive full-page choice). Pages needing JS or a hard paywall can't
+be captured — no browser engine on PyDroid 3.
 
 Output: /storage/emulated/0/Download/<Title>.epub, falls back to cwd.
 Usage: open in PyDroid 3, press Run, paste the URL when prompted (stdin only).
@@ -29,6 +31,7 @@ import importlib
 import json
 import os
 import re
+import secrets
 import subprocess
 import sys
 import time
@@ -42,6 +45,14 @@ from urllib.parse import urljoin, urlparse
 REQUIRED_PACKAGES = { # { import name : pip package name }
     "requests": "requests",
     "bs4": "beautifulsoup4",
+    # 3rd dependency, pure Python (depends only on bs4 itself — no compiler
+    # risk). Exception to the 2-dep rule: no official API exists for reading
+    # an X Article without a paid OAuth app, and there is no way to derive
+    # the required x-client-transaction-id header (Section 6C) without
+    # replicating ~300 lines of reverse-engineered logic that a maintained
+    # library already does. Below the 1,000-star bar normally required for
+    # unofficial deps — accepted deliberately for this one feature.
+    "x_client_transaction": "xclienttransaction",
 }
 
 
@@ -72,6 +83,8 @@ ensure_packages()
 import requests
 from bs4 import BeautifulSoup
 from requests.adapters import HTTPAdapter
+from x_client_transaction import ClientTransaction
+from x_client_transaction.utils import get_ondemand_file_url
 try:
     from urllib3.util.retry import Retry
 except Exception:                       # very old/embedded urllib3
@@ -640,6 +653,254 @@ def tweet_to_article(url: str) -> "dict | None":
 
 
 # ----------------------------------------------------------------------------
+# SECTION 6C — Special-site handler: X Articles (long-form posts)
+# ----------------------------------------------------------------------------
+# x.com/<user>/article/<id> is 100% client-rendered — no og:title, no
+# JSON-LD, nothing (verified empirically) — and unlike a plain tweet there is
+# no public syndication endpoint, so this goes through X's *internal*
+# GraphQL API the same way X's own logged-out web client does:
+#   1. A guest session: POST /1.1/guest/activate.json for a guest token, plus
+#      a SELF-GENERATED csrf token echoed as both a ct0 cookie and an
+#      x-csrf-token header (X only checks that the two match — it never
+#      needs to issue one for a guest).
+#   2. An x-client-transaction-id header X now requires on every GraphQL
+#      call: a per-request signature derived from values embedded in X's own
+#      obfuscated ondemand.s.<hash>.js bundle. We don't derive this
+#      ourselves — the `xclienttransaction` pip package (Section 1) does, by
+#      fetching x.com/home and that JS file once per run.
+#   3. The GraphQL "doc_id" (query id) that selects TweetResultByRestId. X
+#      rotates these every 2-4 weeks specifically to break scrapers that
+#      hardcode one, so instead it's looked up LIVE from a community
+#      registry (fa0311/TwitterInternalAPIDocument, regenerated daily) —
+#      the one piece of this that's actually self-healing against rotation.
+#
+# An Article is a rich-text attachment on an ordinary tweet — its own
+# "article id" is a DIFFERENT number from the tweet hosting it — so fetching
+# one is just TweetResultByRestId on that tweet with fieldToggles asking for
+# the article's Draft.js body alongside the normal tweet fields. Verified
+# empirically against a real article on x.com/Write.
+#
+# HONEST DISCLOSURE: every piece above except the doc_id lookup is a fixed
+# point that breaks the moment X reshuffles its obfuscation or GraphQL
+# schema, with no way for this script to self-heal — only a new release of
+# `xclienttransaction` (or a manual fix here) can. On any failure this
+# returns None and resolve_article() falls back to the generic pipeline,
+# same as every other stage in this file.
+
+ARTICLE_URL_RE = re.compile(
+    r"^https?://(?:[\w.-]+\.)?x\.com/(?:[^/]+/article|i/article)/(\d+)",
+    re.IGNORECASE)
+
+# The public web client's own bearer token — stable for years, shared by
+# every unauthenticated request X's logged-out site makes (rotating it would
+# break x.com itself for logged-out visitors, not just scrapers).
+_GRAPHQL_BEARER = ("Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8"
+                    "xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA")
+_GRAPHQL_REGISTRY = ("https://raw.githubusercontent.com/fa0311/"
+                      "TwitterInternalAPIDocument/develop/docs/json/GraphQL.json")
+_ARTICLE_FIELD_TOGGLES = {
+    "withArticleRichContentState": True, "withArticlePlainText": False,
+    "withArticleSummaryText": False, "withGrokAnalyze": False,
+    "withDisallowedReplyControls": False, "withPayments": False,
+    "withAuxiliaryUserLabels": False,
+}
+
+_gql_registry_cache = None
+
+
+def is_article_url(url: str) -> bool:
+    return bool(ARTICLE_URL_RE.match(url))
+
+
+def _gql_operation(op_name: str) -> "tuple[str, dict] | None":
+    """(doc_id, features) for a GraphQL operation, fetched LIVE each run so a
+       rotated doc_id can't silently break this (see Section 6C banner)."""
+    global _gql_registry_cache
+    if _gql_registry_cache is None:
+        try:
+            _gql_registry_cache = get_session().get(
+                _GRAPHQL_REGISTRY, timeout=TIMEOUT).json()
+        except Exception:
+            _gql_registry_cache = []
+    for entry in _gql_registry_cache:
+        exp = entry.get("exports", {})
+        if exp.get("operationName") == op_name:
+            features = {k: v["value"] == "true"
+                        for k, v in exp["metadata"]["featureSwitch"].items()}
+            return exp["queryId"], features
+    return None
+
+
+def _x_guest_client() -> "tuple[requests.Session, ClientTransaction] | None":
+    """A logged-out X session ready to call the internal GraphQL API. Uses
+       its OWN Session (not the shared get_session()) because it carries an
+       X-specific Authorization/csrf header set that must never leak onto
+       unrelated requests made later in the same run."""
+    s = requests.Session()
+    s.headers.update(HEADERS)
+    try:
+        home = s.get("https://x.com/home", timeout=TIMEOUT)
+        home_soup = BeautifulSoup(home.content, PARSER)
+        ondemand_url = get_ondemand_file_url(response=home_soup)
+        ondemand = s.get(ondemand_url, timeout=TIMEOUT)
+        ct = ClientTransaction(home_page_response=home_soup,
+                               ondemand_file_response=ondemand.text)
+
+        csrf_token = secrets.token_hex(16)
+        s.cookies.set("ct0", csrf_token, domain=".x.com")
+        s.headers["Authorization"] = _GRAPHQL_BEARER
+        guest = s.post("https://api.x.com/1.1/guest/activate.json",
+                       timeout=TIMEOUT).json()["guest_token"]
+        s.cookies.set("gt", guest, domain=".x.com")
+        s.headers.update({
+            "x-guest-token": guest, "x-csrf-token": csrf_token,
+            "x-twitter-active-user": "yes", "x-twitter-client-language": "en",
+            "Referer": "https://x.com/", "content-type": "application/json",
+        })
+        return s, ct
+    except Exception as exc:
+        print(f"[article] could not establish an X session: {exc}")
+        return None
+
+
+def _gql_get(s: requests.Session, ct: ClientTransaction, op_name: str,
+            variables: dict, field_toggles: dict = None) -> "dict | None":
+    """One signed GraphQL GET: fresh transaction-id + live doc_id per call."""
+    op = _gql_operation(op_name)
+    if op is None:
+        print(f"[article] '{op_name}' is missing from the live doc_id "
+              f"registry — X's API may have changed.")
+        return None
+    doc_id, features = op
+    params = {"variables": json.dumps(variables), "features": json.dumps(features)}
+    if field_toggles:
+        params["fieldToggles"] = json.dumps(field_toggles)
+    url = f"https://x.com/i/api/graphql/{doc_id}/{op_name}"
+    try:
+        s.headers["x-client-transaction-id"] = ct.generate_transaction_id(
+            method="GET", path=urlparse(url).path)
+        r = s.get(url, params=params, timeout=TIMEOUT)
+    except Exception as exc:
+        print(f"[article] {op_name} request failed: {exc}")
+        return None
+    if not r.ok:
+        print(f"[article] {op_name} request failed: HTTP {r.status_code}")
+        return None
+    return r.json()
+
+
+_DRAFTJS_BLOCK_TAGS = {
+    "header-one": "h1", "header-two": "h2", "header-three": "h3",
+    "header-four": "h4", "header-five": "h5", "header-six": "h6",
+    "blockquote": "blockquote", "code-block": "pre",
+}
+_DRAFTJS_INLINE_TAGS = {"BOLD": "b", "ITALIC": "i", "STRIKETHROUGH": "s", "CODE": "code"}
+
+
+def _draftjs_block_html(block: dict, entity_map: dict) -> str:
+    """One Draft.js block -> HTML, applying its inline style + link ranges."""
+    text = block.get("text", "")
+    ranges = block.get("inlineStyleRanges", []) + block.get("entityRanges", [])
+    cuts = sorted({0, len(text)} | {r["offset"] for r in ranges}
+                  | {r["offset"] + r["length"] for r in ranges})
+
+    out = []
+    for start, end in zip(cuts, cuts[1:]):
+        chunk = xml(text[start:end])
+        for r in block.get("inlineStyleRanges", []):
+            if r["offset"] <= start and end <= r["offset"] + r["length"]:
+                # X sends TitleCase ("Bold"), not Draft.js's usual "BOLD".
+                tag = _DRAFTJS_INLINE_TAGS.get(r["style"].upper())
+                if tag:
+                    chunk = f"<{tag}>{chunk}</{tag}>"
+        for r in block.get("entityRanges", []):
+            if r["offset"] <= start and end <= r["offset"] + r["length"]:
+                entity = entity_map.get(str(r["key"]), {})
+                if entity.get("type") == "LINK":
+                    href = xml(entity.get("data", {}).get("url", ""))
+                    chunk = f'<a href="{href}">{chunk}</a>'
+        out.append(chunk)
+    return "".join(out)
+
+
+def _draftjs_to_html(content_state: dict) -> str:
+    """An Article's body (Draft.js blocks + entityMap) -> HTML."""
+    entity_map = {e["key"]: e["value"] for e in content_state.get("entityMap", [])}
+    html, list_tag = [], None
+    for block in content_state.get("blocks", []):
+        btype = block.get("type", "unstyled")
+        wanted_list = ("ul" if btype == "unordered-list-item" else
+                      "ol" if btype == "ordered-list-item" else None)
+        if list_tag and list_tag != wanted_list:
+            html.append(f"</{list_tag}>")
+            list_tag = None
+        if wanted_list and not list_tag:
+            html.append(f"<{wanted_list}>")
+            list_tag = wanted_list
+
+        inner = _draftjs_block_html(block, entity_map)
+        if wanted_list:
+            html.append(f"<li>{inner}</li>")
+        else:
+            tag = _DRAFTJS_BLOCK_TAGS.get(btype, "p")
+            html.append(f"<{tag}>{inner}</{tag}>")
+    if list_tag:
+        html.append(f"</{list_tag}>")
+    return "".join(html)
+
+
+def article_to_article(url: str) -> "dict | None":
+    """Turn an x.com Article URL into {title, author, article, base_url} —
+       same shape tweet_to_article() produces. None on any failure, so
+       resolve_article() falls back to the generic pipeline."""
+    m = ARTICLE_URL_RE.match(url)
+    if not m:
+        return None
+    tweet_id = m.group(1)
+    print(f"[article] detected an X Article (tweet id {tweet_id}); "
+          f"using X's internal GraphQL API — this is the fragile path, "
+          f"see Section 6C ...")
+
+    client = _x_guest_client()
+    if client is None:
+        return None
+    s, ct = client
+
+    data = _gql_get(s, ct, "TweetResultByRestId", {
+        "tweetId": tweet_id, "withCommunity": False,
+        "includePromotedContent": False, "withVoice": False,
+    }, field_toggles=_ARTICLE_FIELD_TOGGLES)
+    if data is None:
+        return None
+
+    tweet = (data.get("data") or {}).get("tweetResult", {}).get("result", {}) or {}
+    art = ((tweet.get("article") or {}).get("article_results") or {}).get("result")
+    if not art:
+        print("[article] no article content on that id — may be deleted, "
+              "subscriber-only, or X changed its response shape.")
+        return None
+
+    user = ((tweet.get("core") or {}).get("user_results") or {}).get("result", {}) or {}
+    core, legacy = user.get("core") or {}, user.get("legacy") or {}
+    name = core.get("name") or legacy.get("name") or ""
+    handle = core.get("screen_name") or legacy.get("screen_name") or ""
+    author = f"{name} (@{handle})" if name and handle else (name or handle or "X")
+
+    title = art.get("title") or "Untitled Article"
+    cover = ((art.get("cover_media") or {}).get("media_info") or {}).get("original_img_url")
+    body = f"<h1>{xml(title)}</h1><p class='meta'>by {xml(author)}</p>"
+    if cover:
+        body += f'<img src="{xml(cover)}" alt="cover"/>'
+    body += _draftjs_to_html(art.get("content_state") or {})
+    body += f"<p class='meta'>source: {xml(url)}</p>"
+
+    n_blocks = len((art.get("content_state") or {}).get("blocks", []))
+    print(f"[article] captured '{title}' — {n_blocks} block(s).")
+    return {"title": title, "author": author,
+            "article": BeautifulSoup(body, PARSER), "base_url": url}
+
+
+# ----------------------------------------------------------------------------
 # SECTION 7 — Junk removal
 # ----------------------------------------------------------------------------
 def clean_soup(soup: BeautifulSoup) -> BeautifulSoup:
@@ -913,15 +1174,14 @@ def resolve_output_path(filename: str) -> str:
 # ----------------------------------------------------------------------------
 def resolve_article(url: str) -> "tuple[str, str, BeautifulSoup, str]":
     """Turn a URL into (title, author, article_soup, base_url_for_images).
-       Special-site handler (X/Twitter) first, else the generic fetch +
-       extraction fallback chain from Section 6."""
+       Special-site handlers (X/Twitter, X Articles) first, else the generic
+       fetch + extraction fallback chain from Section 6."""
     # Add future per-site handlers here (each returns the same dict or None).
-    special = tweet_to_article(url)          # None for any non-tweet URL
+    special = tweet_to_article(url) or article_to_article(url)
     if special is not None:
         print(f"[meta ] title : {special['title']}")
         print(f"[meta ] author: {special['author'] or '(not found)'}")
-        print(f"[x    ] tweet captured: "
-              f"{text_len(special['article']):,} characters.")
+        print(f"[x    ] captured {text_len(special['article']):,} characters.")
         return (special["title"], special["author"],
                 special["article"], special["base_url"])
 
