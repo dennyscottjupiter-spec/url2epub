@@ -3,64 +3,23 @@
 """
 url2epub.py (v2) — Web article -> Kindle-friendly EPUB3.
 
-============================================================================
- PLATFORM: ANDROID ONLY, via the PyDroid 3 app.  NOT for Windows/macOS/Linux.
-============================================================================
-  This script is written to run on an Android phone inside PyDroid 3
-  (the Python IDE from the Google Play Store). Every design decision below —
-  the zero-compiled-dependencies rule, the /storage/emulated/0/Download output
-  path, the Samsung Galaxy S24 request fingerprint, the runtime pip install —
-  exists because the target is a phone, not a desktop.
+ANDROID ONLY (PyDroid 3 app), not Windows/macOS/Linux. Runs under desktop
+CPython too, but only as a dev harness (Download path falls back to cwd).
 
-  It will *technically* run under desktop CPython (handy for development), but
-  that is NOT a supported use: on a desktop the Download path doesn't exist so
-  the file lands in the current folder, and none of the Android conveniences
-  apply. Treat any desktop run as a test harness, not the product.
+Zero-compiled-dependencies rule: v1 used lxml (readability-lxml, ebooklib),
+which fails to compile on Android. v2 replaces all of it with pure Python —
+content scorer (Sec 6), hand-rolled EPUB writer (Sec 10), html.parser. Only
+deps are requests + beautifulsoup4 (pure Python, auto-installed by Sec 1).
+Never add a compiled dependency (lxml/Pillow/ebooklib/a JS engine).
 
-WHY v2 EXISTS — THE ONE RULE YOU MUST NOT BREAK: no compiled dependencies.
-  v1 depended on lxml (via readability-lxml and ebooklib). lxml is a COMPILED
-  C extension: pip on Android tries to build it from source, needs libxml2/
-  libxslt dev headers that do not exist on the phone, and crashes. v2 removes
-  every compiled dependency:
+Pipeline (resolve_article, Sec 12): special-site handlers first (Sec 6B —
+currently X/Twitter), else generic fetch + 5-stage extraction fallback
+(DOM scorer -> JSON-LD articleBody -> AMP mirror -> archive.today ->
+interactive full-page choice). Pages needing JS or a hard paywall can't be
+captured — no browser engine on PyDroid 3.
 
-    * readability-lxml -> a built-in pure-Python content scorer (Section 6):
-                          rank containers by text density and link density,
-                          keep the winner (Reader-Mode heuristics).
-    * ebooklib        -> a hand-rolled EPUB3 writer using only the standard
-                          library (an EPUB is just a ZIP full of XML — Sec 10).
-    * lxml parser     -> Python's built-in "html.parser".
-
-  The ONLY two pip deps are requests + beautifulsoup4. Both are PURE PYTHON,
-  so the runtime auto-install (Section 1) can never hit a compiler. If a future
-  change seems to need lxml / Pillow / ebooklib / a JS engine, solve it with
-  the stdlib or a pure-Python approach instead — do NOT add the dependency.
-
-HOW A URL BECOMES AN ARTICLE (resolve_article, Section 12)
-  0. SPECIAL-SITE handlers first (Section 6B). Sites that never expose their
-     text to a plain, JavaScript-free fetch get a dedicated extractor:
-       * X / Twitter -> X's public "syndication" JSON API (no login, no JS).
-  1. GENERIC pipeline — fetch the page (Galaxy-S24 headers + auto-retry),
-     read its metadata, then a five-stage extraction fallback chain:
-       a. Reader-Mode DOM scorer (Section 6).
-       b. JSON-LD articleBody: JS-rendered sites often ship the FULL text
-          inside <script type="application/ld+json"> for SEO — we mine it.
-       c. AMP mirror (<link rel="amphtml">): server-rendered plain HTML.
-       d. archive.today snapshot: recovers many SOFT paywalls / JS-gated
-          pages (best-effort; it is rate-limited and won't beat hard paywalls).
-       e. Interactive choice: use the full cleaned page body, or abort.
-
-  Hard limit (honest disclosure): pages whose text exists ONLY after running
-  JavaScript, and hard subscriber-only paywalls, cannot be captured — that
-  needs a real browser engine, which PyDroid 3 cannot run.
-
-OUTPUT
-  /storage/emulated/0/Download/<Article_Title>.epub   (the phone's Downloads)
-  Falls back to the current folder if that path isn't writable (e.g. on a
-  desktop, or before granting PyDroid 3 the Storage permission).
-
-USAGE (on the phone): open in PyDroid 3, press the yellow ▶ Run button, paste
-  the article URL when prompted. Then open the .epub with a reader / "Send to
-  Kindle". The script is interactive (stdin) and takes no command-line args.
+Output: /storage/emulated/0/Download/<Title>.epub, falls back to cwd.
+Usage: open in PyDroid 3, press Run, paste the URL when prompted (stdin only).
 """
 
 # ----------------------------------------------------------------------------
@@ -73,8 +32,8 @@ import re
 import subprocess
 import sys
 import time
-import zipfile # EPUB files ARE zip files — this is the writer
-from html import escape # turns < > & " into safe XML entities
+import zipfile # EPUB = a zip file
+from html import escape
 from urllib.parse import urljoin, urlparse
 
 # ----------------------------------------------------------------------------
@@ -114,12 +73,11 @@ import requests
 from bs4 import BeautifulSoup
 from requests.adapters import HTTPAdapter
 try:
-    # urllib3 ships with requests; this is where the retry policy lives.
     from urllib3.util.retry import Retry
-except Exception:                       # pragma: no cover - very old/embedded urllib3
+except Exception:                       # very old/embedded urllib3
     from requests.packages.urllib3.util.retry import Retry
 
-PARSER = "html.parser" # Python's built-in HTML parser — no compilation ever
+PARSER = "html.parser" # no compiled parser, ever
 
 # ----------------------------------------------------------------------------
 # SECTION 2 — Configuration
@@ -129,17 +87,10 @@ TIMEOUT = 30
 MAX_IMAGE_BYTES = 10 * 1024 * 1024 # skip images larger than 10 MB
 MIN_GOOD_TEXT = 500 # chars below this = "weak" extraction
 
-# We present as a REAL modern Android phone — a Samsung Galaxy S24
-# (model SM-S921B, Android 14) running Chrome for Android. This matches the
-# tool's true home (PyDroid 3 on a phone) and, crucially, makes UA-sniffing
-# sites serve us their normal server-rendered *mobile* HTML instead of a bot
-# or "unsupported browser" page. We send the matching Client Hints
-# (Sec-CH-UA*) too, because modern Chrome always does and some sites check.
-#
-# NOTE: we deliberately do NOT set Accept-Encoding — requests picks the
-# encodings it can actually decode (gzip/deflate, plus brotli/zstd only if
-# those libraries are present) and decompresses automatically. Advertising
-# "br" by hand would hand us undecodable bytes on a stock PyDroid 3 install.
+# Samsung Galaxy S24 fingerprint (matches Sec-CH-UA client hints below) so
+# UA-sniffing sites serve normal mobile HTML instead of a bot/unsupported page.
+# No Accept-Encoding: requests advertises only codecs it can decode locally;
+# hardcoding "br" would risk undecodable bytes on a stock PyDroid 3 install.
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Linux; Android 14; SM-S921B) AppleWebKit/537.36 "
@@ -234,15 +185,8 @@ def xml(s: str) -> str:
 # SECTION 4 — Download (shared retrying session + archive.today recovery)
 # ----------------------------------------------------------------------------
 class FetchError(Exception):
-    """
-    A page could not be downloaded.
-
-    `status`  = the HTTP status code, or None for a network-level failure.
-    `blocked` = True for paywall / login-wall / bot-protection / rate-limit
-                responses (401/402/403/429/451). resolve_article() treats a
-                `blocked` error as "worth retrying through archive.today"
-                rather than a hard stop.
-    """
+    """A page could not be downloaded. `blocked` = paywall/login/bot/rate-limit
+       (401/402/403/429/451) — resolve_article() retries these via archive.today."""
     def __init__(self, message: str, status=None, blocked: bool = False):
         super().__init__(message)
         self.status = status
@@ -251,8 +195,7 @@ class FetchError(Exception):
 
 def _make_retry() -> Retry:
     """Retry policy for transient failures. Handles the urllib3 kwarg rename
-       (allowed_methods in >=1.26, method_whitelist before that) so it works on
-       whatever urllib3 PyDroid 3 happens to bundle."""
+       (allowed_methods vs method_whitelist) across bundled versions."""
     base = dict(total=3, connect=3, read=3,
                 backoff_factor=0.8,                     # waits ~0.8s, 1.6s, 3.2s
                 status_forcelist=(429, 500, 502, 503, 504),
@@ -345,17 +288,10 @@ _CF_CHALLENGE = ("just a moment", "checking your browser", "cf-browser-verificat
 
 
 def fetch_via_archive(url: str, quiet: bool = False) -> "tuple[str, str] | None":
-    """
-    Recover a soft-paywalled / JS-gated article from archive.today's public
-    snapshot. Returns (html, snapshot_url) or None.
-
-    HONEST CAVEAT: archive.today sits behind Cloudflare, which sometimes serves
-    an anti-bot JavaScript challenge instead of the snapshot. We can't solve
-    that challenge (no JS engine), so we detect it and give up cleanly rather
-    than feeding a "checking your browser" page into the extractor. It also
-    only helps SOFT paywalls that someone has already archived — it is not a
-    key to hard subscriber-only content.
-    """
+    """Recover a soft-paywalled/JS-gated article from archive.today's public
+       snapshot. Returns (html, snapshot_url) or None — best-effort only:
+       Cloudflare sometimes serves a JS challenge we can't solve, and only
+       already-archived SOFT paywalls are recoverable at all."""
     for host in ARCHIVE_HOSTS:
         snapshot = f"{host}/newest/{url}"
         try:
@@ -384,12 +320,7 @@ def fetch_via_archive(url: str, quiet: bool = False) -> "tuple[str, str] | None"
 # SECTION 5 — Metadata (title, author) incl. JSON-LD
 # ----------------------------------------------------------------------------
 def iter_jsonld_objects(soup: BeautifulSoup):
-    """
-    Yield every JSON-LD object on the page.
-    Sites embed structured data as <script type="application/ld+json">{...}.
-    The JSON may be a single object, a list, or wrapped in an "@graph" list —
-    this generator flattens all three shapes.
-    """
+    """Yield every JSON-LD object on the page (flattens plain/list/@graph shapes)."""
     for script in soup.find_all("script", type="application/ld+json"):
         try:
             data = json.loads(script.string or "")
@@ -475,15 +406,9 @@ def link_density(tag) -> float:
 
 
 def score_container(tag) -> float:
-    """
-    Score how 'article-like' a container is. The recipe (same family of
-    heuristics as Readability/Arc90):
-      + long paragraphs are strong evidence of prose
-      + commas indicate real sentences (lists of links have few commas)
-      + class/id names like 'article'/'content' add confidence
-      - class/id names like 'sidebar'/'comments' subtract it
-      - heavy link density disqualifies menus and footers
-    """
+    """Score how 'article-like' a container is (Readability/Arc90-style):
+       long paragraphs + comma density help, sidebar/nav hints and link
+       density hurt."""
     score = 0.0
     for p in tag.find_all(["p", "pre", "blockquote", "li"]):
         t = p.get_text(" ", strip=True)
@@ -527,16 +452,11 @@ def extract_main_content(full_soup: BeautifulSoup) -> BeautifulSoup | None:
 
 
 def jsonld_body_to_soup(ld: dict) -> BeautifulSoup | None:
-    """
-    Fallback #2: build article HTML from JSON-LD 'articleBody'.
-    JS-rendered sites often ship the complete text here for search engines,
-    even when the visible DOM is empty before JavaScript runs.
-    """
+    """Fallback #2: build article HTML from JSON-LD 'articleBody', which
+       JS-rendered sites often ship in full even when the DOM is empty."""
     body = ld.get("articleBody", "")
     if not isinstance(body, str) or len(body.strip()) < MIN_GOOD_TEXT:
         return None
-    # articleBody is plain text; rebuild paragraphs from blank lines
-    # (or from sentence groups if it arrives as one giant line).
     parts = re.split(r"\n\s*\n|\n", body.strip())
     paras = [p.strip() for p in parts if p.strip()]
     html = "".join(f"<p>{xml(p)}</p>" for p in paras)
@@ -552,37 +472,18 @@ def find_amp_url(full_soup: BeautifulSoup, base_url: str) -> str:
 
 
 # ----------------------------------------------------------------------------
-# SECTION 6B — Special-site handler: X / Twitter (the "it doesn't work" case)
+# SECTION 6B — Special-site handler: X / Twitter
 # ----------------------------------------------------------------------------
-# WHY THIS EXISTS
-#   x.com / twitter.com is a login-gated JavaScript single-page app. A plain
-#   GET (all this tool can do — PyDroid 3 has no browser engine to run JS)
-#   returns an almost-empty HTML shell with NO tweet text in it, so the
-#   Reader-Mode scorer in Section 6 finds nothing. That is *why* pasting an X
-#   link used to fail completely.
-#
-#   THE TRICK: X still runs a public, unauthenticated "syndication" service
-#   that powers embedded tweets on third-party websites. Given a tweet id it
-#   returns the whole tweet as clean JSON — text, author, media, and any
-#   quoted tweet — with NO login and NO JavaScript required:
-#
-#       https://cdn.syndication.twimg.com/tweet-result?id=<ID>&lang=en&token=<T>
-#
-#   The endpoint requires *some* non-empty `token` query param (an absent or
-#   empty token just returns "{}"). The token is derived from the tweet id with
-#   the same tiny formula X's own front-end uses — see _tweet_token(). We
-#   verified empirically that the server does not actually re-check the
-#   derivation (any non-empty token is accepted today), but we compute it
-#   correctly anyway so the tool keeps working if X starts validating it.
-#
-# SCOPE (honest disclosure): this captures ONE tweet — plus its quoted tweet
-#   and all attached photos/video posters. The public endpoint does NOT return
-#   the downstream replies of a self-thread, so a multi-tweet thread collapses
-#   to its first tweet. Whole profiles and timelines remain out of scope: those
-#   genuinely require an authenticated, JavaScript-capable browser.
+# x.com is a login-gated JS SPA; a plain GET returns an empty shell, so the
+# Reader-Mode scorer finds nothing. Workaround: X's public, unauthenticated
+# "syndication" endpoint (powers embedded tweets) returns a tweet as clean
+# JSON — text, author, media, quoted tweet — given just its id + a token
+# derived by _tweet_token() (any non-empty token is currently accepted, but
+# we compute the real one in case that changes).
+# Scope: ONE tweet + its quoted tweet + media posters — no thread replies,
+# no profiles/timelines (those need a real authenticated browser).
 
-# A tweet URL is .../<user>/status/<digits> on x.com, twitter.com, the old
-# mobile.twitter.com, or nitter-style mirrors. Capture the numeric status id.
+# .../<user>/status/<digits> on x.com, twitter.com, or nitter-style mirrors.
 TWEET_URL_RE = re.compile(
     r"^https?://(?:[\w.-]+\.)?(?:twitter|x)\.com/[^/]+/status(?:es)?/(\d+)",
     re.IGNORECASE)
@@ -592,12 +493,8 @@ _B36_DIGITS = "0123456789abcdefghijklmnopqrstuvwxyz"
 
 
 def _js_number_to_base36(x: float) -> str:
-    """
-    Port of JavaScript's Number.prototype.toString(36) for a positive float.
-    X's front-end builds the token as ((id / 1e15) * Math.PI).toString(36),
-    and JavaScript renders the FRACTIONAL part in base 36 too — Python has no
-    built-in that does that, so we reproduce it digit by digit.
-    """
+    """Port of JS's Number.prototype.toString(36) for a positive float —
+       Python has no built-in for base-36 fractional digits."""
     if x <= 0:
         return "0"
     int_part = int(x)
@@ -612,9 +509,7 @@ def _js_number_to_base36(x: float) -> str:
     if frac == 0:
         return out
     out += "."
-    # 30 base-36 fractional digits is far more than a float can distinguish;
-    # we stop early once the fraction is exhausted.
-    for _ in range(30):
+    for _ in range(30): # far more digits than a float can distinguish
         frac *= 36
         digit = int(frac)
         out += _B36_DIGITS[digit]
@@ -641,9 +536,7 @@ def fetch_tweet(tweet_id: str) -> "dict | None":
         "id": tweet_id,
         "lang": "en",
         "token": _tweet_token(tweet_id),
-        # The features string is what X's own embed widget sends; the endpoint
-        # ignores unknown flags, so this is harmless but keeps us embed-like.
-        "features": (
+        "features": ( # what X's own embed widget sends; unknown flags are ignored
             "tfw_timeline_list:;tfw_follower_count_sunset:true;"
             "tfw_tweet_edit_backend:on;tfw_refsrc_session:on;"
             "tfw_show_business_verified_badge:on;"
@@ -666,17 +559,13 @@ def fetch_tweet(tweet_id: str) -> "dict | None":
 
 
 def _expand_tweet_text(data: dict) -> str:
-    """
-    Replace t.co shortlinks with their readable display URLs and strip the
-    auto-appended trailing media shortlink. Returns plain (un-escaped) text.
-    """
+    """Replace t.co shortlinks with display URLs; drop the trailing media shortlink."""
     text = data.get("text") or ""
     for u in (data.get("entities") or {}).get("urls", []) or []:
         short = u.get("url")
         shown = u.get("display_url") or u.get("expanded_url")
         if short and shown:
             text = text.replace(short, shown)
-    # Any leftover t.co link is the media link X appends to the text → drop it.
     return re.sub(r"https?://t\.co/\w+", "", text).strip()
 
 
@@ -688,8 +577,7 @@ def _tweet_media_html(data: dict) -> str:
         if not src:
             continue
         kind = m.get("type", "photo")
-        # An EPUB is static, so a video/GIF can only show its poster frame.
-        note = "" if kind == "photo" else (
+        note = "" if kind == "photo" else ( # EPUB is static: video/GIF -> poster only
             f"<p class='meta'>[{xml(kind.replace('_', ' '))} — poster frame; "
             f"open on X to watch]</p>")
         html += f'<img src="{xml(src)}" alt="tweet media"/>{note}'
@@ -705,12 +593,8 @@ def _render_tweet_block(data: dict) -> str:
 
 
 def tweet_to_article(url: str) -> "dict | None":
-    """
-    Turn an x.com/twitter.com tweet URL into the same shape the generic
-    pipeline produces: {title, author, article(BeautifulSoup), base_url}.
-    Returns None if this isn't a tweet URL or the fetch fails (so main() can
-    fall back to the normal pipeline — e.g. for a twitter.com *blog* link).
-    """
+    """Turn a tweet URL into {title, author, article, base_url} — the same
+       shape the generic pipeline produces. None if not a tweet URL or fetch failed."""
     m = TWEET_URL_RE.match(url)
     if not m:
         return None
@@ -765,19 +649,7 @@ def clean_soup(soup: BeautifulSoup) -> BeautifulSoup:
 
     junk_re = re.compile("|".join(re.escape(k) for k in JUNK_KEYWORDS), re.I)
     for tag in soup.find_all(True):
-        # CRITICAL — skip already-decomposed nodes (see the bug note below).
-        # find_all() captured a STATIC snapshot of every tag before we began
-        # deleting. When we decompose() a junk container in this loop, bs4
-        # >= 4.13 nulls out .attrs (and .name) on that node AND every one of
-        # its descendants. Those dead descendants are still sitting in our
-        # snapshot, so when the loop later reaches one, `tag.get(...)` becomes
-        # `None.get(...)` and raises:
-        #     AttributeError: 'NoneType' object has no attribute 'get'
-        # This is the real cause of the "crashes on Wikipedia" bug. Note the
-        # once-suggested `tag.get("class") or []` does NOT fix it — it still
-        # dereferences the None .attrs. Skipping decomposed nodes is the fix.
-        # getattr(..., False) keeps this a no-op on the OLDER bs4 bundled with
-        # PyDroid 3 (which lacks .decomposed and never had the crash anyway).
+        # bs4 >= 4.13 decompose()-in-loop gotcha — see CLAUDE.md. Skip dead nodes.
         if getattr(tag, "decomposed", False):
             continue
         if tag.name in ("html", "body"):
@@ -785,13 +657,9 @@ def clean_soup(soup: BeautifulSoup) -> BeautifulSoup:
         ident = " ".join(tag.get("class") or []) + " " + (tag.get("id") or "") \
                 + " " + (tag.get("role") or "")
         if junk_re.search(ident):
-            # PROTECT REAL CONTENT from a false-positive keyword match. Some
-            # sites put a junk word right in the ARTICLE container's own class:
-            # Substack wraps every post in <article class="newsletter-post">,
-            # and "newsletter" is in JUNK_KEYWORDS — so the naive rule deleted
-            # the whole article (14k chars → 238). Genuine junk (nav, ads,
-            # share bars, cookie/subscribe widgets) is ALWAYS either small or
-            # mostly links, so we refuse to delete a big, link-sparse block.
+            # Don't wipe a real article whose class happens to match a junk
+            # keyword (e.g. Substack's "newsletter-post"): junk is always
+            # small or link-heavy, so protect big, link-sparse blocks.
             if text_len(tag) > 300 and link_density(tag) < 0.5:
                 continue
             tag.decompose()
@@ -839,11 +707,8 @@ def pick_image_url(img_tag) -> str:
 
 
 def collect_images(soup: BeautifulSoup, base_url: str) -> list[tuple[str, str, bytes]]:
-    """
-    Download every <img>; rewrite its src to an internal EPUB path.
-    Returns [(internal_path, mime_type, raw_bytes), ...].
-    Failed images are removed from the article (better than broken icons).
-    """
+    """Download every <img>, rewrite its src to an internal EPUB path, return
+       [(internal_path, mime_type, raw_bytes), ...]. Failed images are dropped."""
     images, seen, count = [], {}, 0
     for img in soup.find_all("img"):
         raw = pick_image_url(img)
@@ -883,16 +748,11 @@ SPLIT_MARK = "\x00URL2EPUB_SPLIT\x00" # control chars never occur in articles
 
 
 def split_into_chapters(soup: BeautifulSoup) -> list[tuple[str, str]]:
-    """
-    Returns [(chapter_title, chapter_html), ...].
-
-    v2 strategy: insert an invisible marker BEFORE every h1/h2 wherever it
-    sits in the tree (v1 required all headings to share one parent), then
-    split the serialized HTML on the marker. Re-parsing each fragment with
-    BeautifulSoup repairs any tags broken by the cut.
-    """
+    """[(chapter_title, chapter_html), ...]. Inserts an invisible marker before
+       every h1/h2 (works regardless of tree position), splits the serialized
+       HTML on it, then re-parses each fragment to repair broken tags."""
     headings = soup.find_all(["h1", "h2"])
-    if len(headings) < 2: # short article → one chapter
+    if len(headings) < 2: # short article -> one chapter
         return [("Article", str(soup))]
 
     titles = ["Introduction"]
@@ -912,15 +772,10 @@ def split_into_chapters(soup: BeautifulSoup) -> list[tuple[str, str]]:
 # ----------------------------------------------------------------------------
 # SECTION 10 — Hand-rolled EPUB3 writer (standard library only)
 # ----------------------------------------------------------------------------
-# An EPUB is a ZIP archive with a fixed skeleton:
-# mimetype ← MUST be the first file, MUST be uncompressed
-# META-INF/container.xml ← points to the "package document" below
-# EPUB/content.opf ← manifest (every file) + spine (reading order)
-# EPUB/nav.xhtml ← modern EPUB3 table of contents
-# EPUB/toc.ncx ← legacy TOC (older Kindles still read this)
-# EPUB/*.xhtml, css, images ← the actual book
-# Every .xhtml file must be WELL-FORMED XML (hence the xml() escaping and
-# BeautifulSoup's self-closing output for <img/>, <br/>, <hr/>).
+# An EPUB is a ZIP with a fixed skeleton: mimetype (first, uncompressed) ->
+# META-INF/container.xml -> EPUB/content.opf (manifest+spine) -> nav.xhtml
+# (EPUB3 TOC) + toc.ncx (legacy TOC) -> xhtml/css/image files. Every .xhtml
+# must be well-formed XML (hence xml() escaping + bs4's self-closing tags).
 
 XHTML_SHELL = """<?xml version="1.0" encoding="utf-8"?>
 <!DOCTYPE html>
@@ -938,14 +793,11 @@ CONTAINER_XML = """<?xml version="1.0" encoding="utf-8"?>
 
 
 def soup_to_xhtml_body(html_fragment: str) -> str:
-    """
-    Re-serialize an HTML fragment through BeautifulSoup, which outputs
-    XHTML-style void elements (<img/>, <br/>, <hr/>) and escapes & < > —
-    exactly what EPUB's XML parser requires.
-    """
+    """Re-serialize through BeautifulSoup for XHTML-style void elements
+       (<img/>, <br/>) and & < > escaping, as EPUB's XML parser requires."""
     frag = BeautifulSoup(html_fragment, PARSER)
     for bad in frag.find_all(["html", "body", "head"]):
-        bad.unwrap() # keep only the inner content
+        bad.unwrap()
     return frag.decode()
 
 
@@ -1060,19 +912,9 @@ def resolve_output_path(filename: str) -> str:
 # SECTION 12 — Main program flow
 # ----------------------------------------------------------------------------
 def resolve_article(url: str) -> "tuple[str, str, BeautifulSoup, str]":
-    """
-    Turn a URL into (title, author, article_soup, base_url_for_images).
-
-    Order of attack:
-      0. SPECIAL-SITE handlers (currently X/Twitter). Sites that never expose
-         their text to a non-JavaScript fetch get their own dedicated extractor
-         and skip the generic pipeline entirely.
-      1. GENERIC pipeline — fetch the page, read its metadata, then run the
-         four-stage extraction fallback chain from Section 6:
-             Reader-Mode scorer → JSON-LD articleBody → AMP mirror
-             → interactive (full cleaned page body, or abort).
-    """
-    # --- Step 0: special-site handlers ------------------------------------
+    """Turn a URL into (title, author, article_soup, base_url_for_images).
+       Special-site handler (X/Twitter) first, else the generic fetch +
+       extraction fallback chain from Section 6."""
     # Add future per-site handlers here (each returns the same dict or None).
     special = tweet_to_article(url)          # None for any non-tweet URL
     if special is not None:
@@ -1137,9 +979,7 @@ def resolve_article(url: str) -> "tuple[str, str, BeautifulSoup, str]":
             except FetchError:
                 pass  # AMP fetch failed → keep going
 
-    # Soft-paywall / weak-extraction recovery via archive.today. Skipped when
-    # the page was ALREADY loaded from a snapshot at fetch time (no point
-    # re-fetching the same snapshot).
+    # Skip if already loaded from a snapshot at fetch time.
     if (article is None or text_len(article) < MIN_GOOD_TEXT) and not used_archive:
         print("[extract] still weak — trying archive.today snapshot ...")
         snap = fetch_via_archive(url)
@@ -1176,9 +1016,7 @@ def resolve_article(url: str) -> "tuple[str, str, BeautifulSoup, str]":
 
 
 def main() -> None:
-    """Interactive entry point: prompt for a URL, resolve it to an article
-       (Section 12's resolve_article), then build and write the .epub —
-       download images, split into chapters, and serialize the EPUB3 ZIP."""
+    """Interactive entry point: URL -> resolve_article -> build & write the .epub."""
     print("=" * 60)
     print(" url2epub v2 — turn any article into a Kindle EPUB")
     print("=" * 60)
