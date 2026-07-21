@@ -129,6 +129,13 @@ Tuning knobs are the module constants in **Section 2** (`OUTPUT_DIR`, `TIMEOUT`,
 junk/hint lists), plus `ARCHIVE_HOSTS` (Section 4), `TWEET_URL_RE` (Section 6B), and `ARTICLE_URL_RE` /
 `_GRAPHQL_REGISTRY` (Section 6C).
 
+## Git workflow
+
+This repo has no feature branches — work happens directly on `main`. Every change gets an
+atomic commit; commits get pushed to `origin/main` before a task is considered done (per the
+global CLAUDE.md git policy — "full housekeeping" here means committed + pushed + no stray
+branches left behind, not a merge, since there's nothing to merge into).
+
 ## Known compatibility gotcha (bs4 ≥ 4.13 crash — the REAL cause)
 
 The script targets the older BeautifulSoup PyDroid 3 ships, but must not crash on newer bs4
