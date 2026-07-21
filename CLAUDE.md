@@ -129,6 +129,43 @@ Tuning knobs are the module constants in **Section 2** (`OUTPUT_DIR`, `TIMEOUT`,
 junk/hint lists), plus `ARCHIVE_HOSTS` (Section 4), `TWEET_URL_RE` (Section 6B), and `ARTICLE_URL_RE` /
 `_GRAPHQL_REGISTRY` (Section 6C).
 
+## Navigating this file efficiently (token budget)
+
+`url2epub.py` is one ~1,300-line module (~15K tokens). **Do not full-read it to make a
+localized change** — that burns the whole budget every time. Instead use this section catalog to
+pick the one or two sections you need, then read only those. The file itself stays a single
+self-contained script (that's a hard product constraint); this catalog is the "which part do I
+need?" index that lives *outside* the code so the code stays lean.
+
+**Workflow:**
+1. **Locate live:** `Grep "^# SECTION"` on the file returns every banner with its *current* line
+   number in one shot. (The line numbers in the table below are a snapshot — trust the Grep after
+   any big edit shifts them.)
+2. **Read one section:** `Read` with `offset`/`limit` for just its range — a section spans from
+   its own start line to the next section's start line. e.g. Section 6C ≈ `offset 656, limit 250`.
+3. **Find a symbol:** `Grep` the function/constant name; the table tells you which section owns it,
+   then read that section.
+
+**Section catalog** (start line · purpose · key symbols):
+
+| § | Line | Purpose | Key symbols |
+|---|------|---------|-------------|
+| 0  | 28   | stdlib imports | — |
+| 1  | 43   | runtime auto-install of the 3 pure-Python deps | `ensure_packages`, `REQUIRED_PACKAGES` |
+| 2  | 96   | **all tuning knobs / config constants** | `OUTPUT_DIR`, `TIMEOUT`, `MAX_IMAGE_BYTES`, `MIN_GOOD_TEXT`, `HEADERS`, `JUNK_TAGS`, `JUNK_KEYWORDS`, `POSITIVE_HINTS`, `NEGATIVE_HINTS`, `EPUB_CSS` |
+| 3  | 165  | small pure helpers | `normalize_url`, `sanitize_filename`, `text_len`, `xml` |
+| 4  | 198  | fetch: retrying session + archive.today recovery | `get_session`, `fetch_page`, `FetchError`, `_decode`, `fetch_via_archive`, `ARCHIVE_HOSTS` |
+| 5  | 333  | metadata (title/author) incl. JSON-LD | `find_jsonld_article`, `detect_title`, `detect_author`, `iter_jsonld_objects` |
+| 6  | 409  | pure-Python Reader-Mode content extraction | `extract_main_content`, `score_container`, `link_density`, `jsonld_body_to_soup`, `find_amp_url` |
+| 6B | 488  | special-site: X / Twitter tweets (syndication JSON) | `tweet_to_article`, `fetch_tweet`, `_tweet_token`, `TWEET_URL_RE` |
+| 6C | 656  | special-site: X Articles (internal GraphQL, Draft.js) | `article_to_article`, `_draftjs_to_html`, `_x_guest_client`, `_gql_get`, `ARTICLE_URL_RE`, `_GRAPHQL_REGISTRY` |
+| 7  | 904  | junk removal / soup cleanup | `clean_soup` |
+| 8  | 949  | image download + EPUB embedding | `collect_images`, `pick_image_url`, `IMG_MIME` |
+| 9  | 1006 | chapter splitting on h1/h2 | `split_into_chapters`, `SPLIT_MARK` |
+| 10 | 1034 | hand-rolled EPUB3 writer (zip + templates) | `write_epub`, `soup_to_xhtml_body`, `XHTML_SHELL`, `CONTAINER_XML` |
+| 11 | 1159 | output-path resolution (Android Download → cwd) | `resolve_output_path` |
+| 12 | 1173 | orchestration | `resolve_article` (URL → title/author/soup/base_url), `main` |
+
 ## Git workflow
 
 This repo has no feature branches — work happens directly on `main`. Every change gets an
