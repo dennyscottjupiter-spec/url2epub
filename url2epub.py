@@ -484,6 +484,117 @@ def find_amp_url(full_soup: BeautifulSoup, base_url: str) -> str:
     return ""
 
 
+def extract_from_noscript(full_soup: BeautifulSoup) -> "BeautifulSoup | None":
+    """Fallback: many JS-rendered sites ship a full server-rendered copy of
+       the page inside <noscript> purely for SEO/no-JS clients. Reparse it
+       and run it through the same scorer used on the live DOM."""
+    for tag in full_soup.find_all("noscript"):
+        inner = tag.decode_contents()
+        if len(inner) < MIN_GOOD_TEXT:
+            continue
+        article = extract_main_content(BeautifulSoup(inner, PARSER))
+        if article is not None and text_len(article) >= MIN_GOOD_TEXT:
+            return article
+    return None
+
+
+# extract_from_state() false-positive guard: a fragment must clear these
+# thresholds before it's trusted as prose rather than minified JS/CSS/base64.
+_PROSE_MIN_FRAGMENT_LEN = 40
+_PROSE_SPACE_RATIO_MIN = 0.08
+_PROSE_BRACE_DENSITY_MAX = 0.02
+_PROSE_BASE64_RE = re.compile(r"^[A-Za-z0-9+/=_\-]+$")
+
+
+def _looks_like_prose(s: str) -> bool:
+    """Reject minified JS/CSS/config and base64 blobs that would otherwise
+       pass a bare length check. Validated during diagnosis: on a live page
+       this correctly ranked article prose above an inline
+       'history.scrollRestoration' script sitting in the same <script> soup."""
+    if len(s) < _PROSE_MIN_FRAGMENT_LEN:
+        return False
+    if _PROSE_BASE64_RE.match(s.replace(" ", "").replace("\n", "")):
+        return False
+    if s.count(" ") / len(s) < _PROSE_SPACE_RATIO_MIN:
+        return False
+    if (s.count("{") + s.count(";")) / len(s) > _PROSE_BRACE_DENSITY_MAX:
+        return False
+    # A long single-line string with no sentence break at all is suspicious
+    # (a URL, a long identifier list, ...); a short one may just be a single
+    # sentence with its only period at the very end, which is fine.
+    if len(s) > 250 and ". " not in s and "\n" not in s:
+        return False
+    return True
+
+
+def _walk_json_strings(obj, out: list) -> None:
+    """Recursively collect every prose-looking string in a parsed JSON blob."""
+    if isinstance(obj, str):
+        if _looks_like_prose(obj):
+            out.append(obj)
+    elif isinstance(obj, dict):
+        for v in obj.values():
+            _walk_json_strings(v, out)
+    elif isinstance(obj, list):
+        for v in obj:
+            _walk_json_strings(v, out)
+
+
+def _extract_json_blob(text: str):
+    """A <script> tag's raw text may be pure JSON, or JSON assigned to a
+       variable (window.__NEXT_DATA__ = {...};). Try a direct parse first,
+       else slice the outermost {...}/[...] and parse that."""
+    text = text.strip()
+    try:
+        return json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        pass
+    starts = [i for i in (text.find("{"), text.find("[")) if i != -1]
+    if not starts:
+        return None
+    start = min(starts)
+    end = text.rfind("}" if text[start] == "{" else "]")
+    if end <= start:
+        return None
+    try:
+        return json.loads(text[start:end + 1])
+    except (json.JSONDecodeError, ValueError):
+        return None
+
+
+def extract_from_state(full_soup: BeautifulSoup) -> "BeautifulSoup | None":
+    """Fallback: JS-rendered sites commonly embed the page's data as JSON in
+       a <script> tag under one of several framework-specific globals
+       (__NEXT_DATA__, __NUXT__, __APOLLO_STATE__, __remixContext, RSC
+       'self.__next_f' chunks, ...). Rather than one handler per framework,
+       every one of those reduces to "there's JSON in a <script>, and the
+       article is somewhere inside it" — so mine every inline <script> for
+       every prose-looking string and stitch the survivors together."""
+    found = []
+    for tag in full_soup.find_all("script"):
+        if tag.get("src"):
+            continue
+        text = tag.string or tag.get_text()
+        if not text or "{" not in text:
+            continue
+        blob = _extract_json_blob(text)
+        if blob is not None:
+            _walk_json_strings(blob, found)
+
+    seen, fragments, total = set(), [], 0
+    for s in found:
+        if s in seen:      # dual-serialized state (e.g. RSC + hydration) repeats content
+            continue
+        seen.add(s)
+        fragments.append(s)
+        total += len(s)
+    if total < MIN_GOOD_TEXT:
+        return None
+
+    parts = [s if "<" in s and ">" in s else f"<p>{xml(s)}</p>" for s in fragments]
+    return BeautifulSoup("".join(parts), PARSER)
+
+
 # ----------------------------------------------------------------------------
 # SECTION 6B — Special-site handler: X / Twitter
 # ----------------------------------------------------------------------------
