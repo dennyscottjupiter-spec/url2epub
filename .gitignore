@@ -11,6 +11,9 @@ __pycache__/
 # --- X Article cookie auth (Section 6C) — a session token, never commit ---
 x_cookies.txt
 
+# --- Playwright MCP test artifacts (screenshots/snapshots from manual verification) ---
+.playwright-mcp/
+
 # --- OS / editor cruft ---
 .DS_Store
 Thumbs.db
