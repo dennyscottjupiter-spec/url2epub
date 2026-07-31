@@ -390,13 +390,14 @@ def fetch_via_wayback(url: str, quiet: bool = False) -> "tuple[str, str] | None"
 _JINA_HEADERS = {"User-Agent": "url2epub/2.0 (+personal reader)"}
 
 
-def fetch_via_jina(url: str, quiet: bool = False) -> "tuple[str, str] | None":
+def fetch_via_jina(url: str, quiet: bool = False) -> "tuple[str, str, str] | None":
     """Last-resort recovery via Jina Reader (r.jina.ai), which renders JS
        server-side and returns the readable text. MUST use its own clean
        session/UA: the shared Galaxy S24 browser fingerprint gets a 403
        Cloudflare challenge in front of r.jina.ai (verified empirically) —
        a plain non-browser UA is let through instead. Skips x.com entirely:
-       Jina blocks it outright with AbuseAlleviationError (verified)."""
+       Jina blocks it outright with AbuseAlleviationError (verified).
+       Returns (article_html, url, title) or None."""
     if "x.com" in url or "twitter.com" in url:
         return None
     try:
@@ -410,12 +411,23 @@ def fetch_via_jina(url: str, quiet: bool = False) -> "tuple[str, str] | None":
     content = resp.text.strip()
     if len(content) < MIN_GOOD_TEXT:
         return None
+
+    # Jina prefixes "Title: ...\nURL Source: ...\nPublished Time: ...\n\n
+    # Markdown Content:\n" before the actual body — pull the title out and
+    # strip the header so it doesn't become the article's first paragraph.
+    title_m = re.match(r"Title:\s*(.+)", content)
+    title = title_m.group(1).strip() if title_m else ""
+    marker = "Markdown Content:"
+    idx = content.find(marker)
+    body = content[idx + len(marker):].strip() if idx != -1 else content
+    if len(body) < MIN_GOOD_TEXT:
+        return None
+
     if not quiet:
-        print(f"[jina] recovered {len(content):,} chars via Jina Reader")
-    # Jina's response is markdown/plain text, not HTML — wrap it as paragraphs.
-    parts = re.split(r"\n\s*\n", content)
+        print(f"[jina] recovered {len(body):,} chars via Jina Reader")
+    parts = re.split(r"\n\s*\n", body)
     html = "".join(f"<p>{xml(p.strip())}</p>" for p in parts if p.strip())
-    return html, url
+    return html, url, title
 
 
 # ----------------------------------------------------------------------------
@@ -1712,20 +1724,37 @@ def resolve_article(url: str) -> "tuple[str, str, BeautifulSoup, str]":
     try:
         html, final_url = fetch_page(url)
     except FetchError as exc:
-        # A blocked page (paywall/login/bot wall) is worth one archive.today
-        # attempt before we give up; any other error is a hard stop.
-        if exc.blocked:
-            print(f"[fetch] {exc}")
-            print("[archive] blocked — trying archive.today snapshot ...")
-            snap = fetch_via_archive(url)
-            if snap is None:
-                sys.exit(f"ERROR: {exc}\n"
-                         f"       No archive.today snapshot was available "
-                         f"either — this page needs a login or a real browser.")
-            html, final_url = snap
-            used_archive = True
-        else:
+        # A blocked page (paywall/login/bot wall) is worth archive.today,
+        # Wayback, and Jina attempts before we give up; any other error is a
+        # hard stop.
+        if not exc.blocked:
             sys.exit(f"ERROR: {exc}")
+        print(f"[fetch] {exc}")
+        print("[archive] blocked — trying archive.today snapshot ...")
+        snap = fetch_via_archive(url)
+        if snap is None:
+            print("[wayback] trying the Wayback Machine ...")
+            snap = fetch_via_wayback(url)
+        if snap is None:
+            print("[jina] trying Jina Reader ...")
+            jina = fetch_via_jina(url)
+            if jina is None:
+                sys.exit(f"ERROR: {exc}\n"
+                         f"       No archive.today/Wayback snapshot was available "
+                         f"and Jina Reader also failed — this page needs a "
+                         f"login or a real browser.")
+            # Jina hands back an already-built article (not a raw page), so
+            # skip the rest of the pipeline and return straight away.
+            jina_html, jina_url, jina_title = jina
+            article = BeautifulSoup(jina_html, PARSER)
+            title = jina_title or "Untitled Article"
+            print(f"[meta ] title : {title}")
+            print("[meta ] author: (not found)")
+            print(f"[extract] clean article text: {text_len(article):,} "
+                  f"characters (via Jina Reader).")
+            return title, "", article, jina_url
+        html, final_url = snap
+        used_archive = True
     if not used_archive and final_url != url:
         print(f"[fetch] redirected to {final_url}")
 
@@ -1819,9 +1848,11 @@ def resolve_article(url: str) -> "tuple[str, str, BeautifulSoup, str]":
         print("[extract] still weak — trying Jina Reader ...")
         jina = fetch_via_jina(url)
         if jina is not None:
-            jina_html, jina_url = jina
+            jina_html, jina_url, jina_title = jina
             article = BeautifulSoup(jina_html, PARSER)
             final_url = jina_url
+            if title in ("", "Untitled Article") and jina_title:
+                title = jina_title
             print("[extract] recovered article via Jina Reader.")
 
     if article is None or text_len(article) < MIN_GOOD_TEXT:
