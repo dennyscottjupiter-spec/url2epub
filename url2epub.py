@@ -691,7 +691,7 @@ def tweet_to_article(url: str) -> "dict | None":
 # EPUB for X's JS-only shell) — it exits with a clear "try again" message.
 
 ARTICLE_URL_RE = re.compile(
-    r"^https?://(?:[\w.-]+\.)?x\.com/(?:[^/]+/article|i/article)/(\d+)",
+    r"^https?://(?:[\w.-]+\.)?x\.com/(?P<handle>[^/]+)/article/(?P<id>\d+)",
     re.IGNORECASE)
 
 # The public web client's own bearer token — stable for years, shared by
@@ -767,6 +767,94 @@ def _x_guest_client() -> "tuple[requests.Session, ClientTransaction] | None":
     except Exception as exc:
         print(f"[article] could not establish an X session: {exc}")
         return None
+
+
+def _find_x_cookie_file() -> "str | None":
+    for candidate in (
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "x_cookies.txt"),
+        os.path.join(OUTPUT_DIR, "x_cookies.txt"),
+    ):
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def _x_auth_client() -> "tuple[requests.Session, ClientTransaction] | None":
+    """Like _x_guest_client() but authenticated with a real X session, read
+       from x_cookies.txt (two lines: auth_token=... and ct0=...), looked up
+       next to the script then in OUTPUT_DIR. Required for x.com/i/article/
+       URLs: X returns HTTP 404 for Article-entity lookups to guests
+       (verified empirically) — there is no login-free path for those.
+       Returns None silently (no file = normal, not an error) so callers can
+       fall back to an honest "needs login" message rather than crash."""
+    path = _find_x_cookie_file()
+    if path is None:
+        return None
+    cookies = {}
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, _, v = line.partition("=")
+                    cookies[k.strip()] = v.strip()
+    except OSError as exc:
+        print(f"[article] could not read x_cookies.txt: {exc}")
+        return None
+    auth_token, ct0 = cookies.get("auth_token"), cookies.get("ct0")
+    if not auth_token or not ct0:
+        print("[article] x_cookies.txt is missing auth_token or ct0 — "
+              "see CLAUDE.md for the expected format.")
+        return None
+
+    s = requests.Session()
+    s.headers.update(HEADERS)
+    adapter = HTTPAdapter(max_retries=_make_retry())
+    s.mount("https://", adapter)
+    s.mount("http://", adapter)
+    try:
+        home = s.get("https://x.com/home", timeout=TIMEOUT)
+        home_soup = BeautifulSoup(home.content, PARSER)
+        ondemand_url = get_ondemand_file_url(response=home_soup)
+        ondemand = s.get(ondemand_url, timeout=TIMEOUT)
+        ct = ClientTransaction(home_page_response=home_soup,
+                               ondemand_file_response=ondemand.text)
+        s.cookies.set("auth_token", auth_token, domain=".x.com")
+        s.cookies.set("ct0", ct0, domain=".x.com")
+        s.headers["Authorization"] = _GRAPHQL_BEARER
+        s.headers.update({
+            "x-csrf-token": ct0, "x-twitter-active-user": "yes",
+            "x-twitter-auth-type": "OAuth2Session",
+            "x-twitter-client-language": "en",
+            "Referer": "https://x.com/", "content-type": "application/json",
+        })
+        return s, ct
+    except Exception as exc:
+        print(f"[article] could not establish an authenticated X session: {exc}")
+        return None
+
+
+def _find_article_dict(obj) -> "dict | None":
+    """Recursively search a parsed GraphQL response for the Article's own
+       result dict, identified by having both 'title' and 'content_state'
+       (the shape already proven for article_results.result under
+       TweetResultByRestId). ArticleEntityResultByRestId's wrapping key is
+       UNVERIFIED — guest access 404s before ever reaching a real payload —
+       so this sidesteps guessing that key and is resilient to whatever
+       wrapper X actually uses."""
+    if isinstance(obj, dict):
+        if "title" in obj and "content_state" in obj:
+            return obj
+        for v in obj.values():
+            found = _find_article_dict(v)
+            if found is not None:
+                return found
+    elif isinstance(obj, list):
+        for item in obj:
+            found = _find_article_dict(item)
+            if found is not None:
+                return found
+    return None
 
 
 def _gql_get(s: requests.Session, ct: ClientTransaction, op_name: str,
@@ -865,32 +953,84 @@ class _ArticleTransient(Exception):
 
 _ARTICLE_ATTEMPTS = 3   # X rate-limits guest access hard; a couple of retries with backoff clears it
 
+# Definitive (non-retryable) outcomes of an Article fetch, and the message
+# resolve_article() should show for each — see Section 12.
+_ARTICLE_ERROR_NEEDS_LOGIN = "needs_login"
+_ARTICLE_ERROR_AUTH_REJECTED = "auth_rejected"
+_ARTICLE_ERROR_NOT_FOUND = "not_found"
+_ARTICLE_ERROR_TRANSIENT_EXHAUSTED = "transient_exhausted"
+_LAST_ARTICLE_ERROR = None   # set by _article_once/article_to_article, read by resolve_article
 
-def _article_once(url: str, tweet_id: str) -> "dict | None":
+
+def _article_once(url: str, candidate_id: str, is_i_shape: bool) -> "dict | None":
     """One full X-Article fetch attempt. Returns the built dict on success,
-       None if the id definitively has no readable article, or raises
-       _ArticleTransient for a failure worth retrying."""
+       None if the id definitively has no readable article (sets
+       _LAST_ARTICLE_ERROR with why), or raises _ArticleTransient for a
+       failure worth retrying.
+
+       THE BUG THIS FIXES: an Article's own id is a DIFFERENT number from
+       any tweet that hosts it (verified empirically — real article ids
+       return an empty tweetResult from TweetResultByRestId). x.com/i/article/
+       URLs are known to carry the Article's own id. x.com/<handle>/article/
+       URLs are assumed to carry the hosting tweet's id (the historical,
+       cheaper, no-login path) but that assumption is unverified — no real
+       example of that URL shape could be found to test against. So rather
+       than hard-route by shape, we try the cheap tweet-id path first
+       whenever the shape allows it, and treat ANY empty result as proof
+       that <id> was actually an Article entity id — which requires a
+       logged-in session (guest access 404s, verified empirically)."""
+    global _LAST_ARTICLE_ERROR
+    _LAST_ARTICLE_ERROR = None
     client = _x_guest_client()
     if client is None:
         raise _ArticleTransient("could not establish an X guest session")
     s, ct = client
 
-    data = _gql_get(s, ct, "TweetResultByRestId", {
-        "tweetId": tweet_id, "withCommunity": False,
-        "includePromotedContent": False, "withVoice": False,
-    }, field_toggles=_ARTICLE_FIELD_TOGGLES)
-    if data is None:
-        raise _ArticleTransient("GraphQL request failed (HTTP error or rate limit)")
+    tweet, art = {}, None
+    if not is_i_shape:
+        data = _gql_get(s, ct, "TweetResultByRestId", {
+            "tweetId": candidate_id, "withCommunity": False,
+            "includePromotedContent": False, "withVoice": False,
+        }, field_toggles=_ARTICLE_FIELD_TOGGLES)
+        if data is None:
+            raise _ArticleTransient("GraphQL request failed (HTTP error or rate limit)")
+        tweet = (data.get("data") or {}).get("tweetResult", {}).get("result", {}) or {}
+        if not tweet and data.get("errors"):
+            # No result at all + an errors array => usually a rate-limit/auth
+            # blip, not a genuinely article-less tweet. Worth another attempt.
+            raise _ArticleTransient(
+                f"X returned an error: {data['errors'][0].get('message', 'unknown')}")
+        art = ((tweet.get("article") or {}).get("article_results") or {}).get("result")
 
-    tweet = (data.get("data") or {}).get("tweetResult", {}).get("result", {}) or {}
-    if not tweet and data.get("errors"):
-        # No result at all + an errors array => usually a rate-limit/auth blip,
-        # not a genuinely article-less tweet. Worth another attempt.
-        raise _ArticleTransient(
-            f"X returned an error: {data['errors'][0].get('message', 'unknown')}")
-
-    art = ((tweet.get("article") or {}).get("article_results") or {}).get("result")
     if not art:
+        # Either an i/article/ URL, or the tweet-id guess came back empty —
+        # both mean <candidate_id> is the Article's own entity id, which X
+        # only serves to an authenticated session.
+        auth = _x_auth_client()
+        if auth is None:
+            _LAST_ARTICLE_ERROR = _ARTICLE_ERROR_NEEDS_LOGIN
+            print("[article] this Article has no guest-readable API — a "
+                  "logged-in X session is required (see CLAUDE.md for "
+                  "x_cookies.txt setup).")
+            return None
+        s, ct = auth
+        data = _gql_get(s, ct, "ArticleEntityResultByRestId",
+                        {"articleId": candidate_id},
+                        field_toggles={"withPayments": False,
+                                       "withAuxiliaryUserLabels": False})
+        if data is None:
+            raise _ArticleTransient("authenticated GraphQL request failed")
+        if data.get("errors"):
+            _LAST_ARTICLE_ERROR = _ARTICLE_ERROR_AUTH_REJECTED
+            print(f"[article] the authenticated session was rejected "
+                  f"({data['errors'][0].get('message', 'unknown')}) — the "
+                  f"session in x_cookies.txt has likely expired; refresh it.")
+            return None
+        art = _find_article_dict(data.get("data") or {})
+        tweet = {}   # no hosting-tweet metadata available on this path
+
+    if not art:
+        _LAST_ARTICLE_ERROR = _ARTICLE_ERROR_NOT_FOUND
         print("[article] no article content on that id — may be deleted, "
               "subscriber-only, or X changed its response shape.")
         return None
@@ -922,17 +1062,20 @@ def article_to_article(url: str) -> "dict | None":
        only on a definitive miss or after all attempts are exhausted, so
        resolve_article() can then react (see there — it no longer silently
        emits an empty EPUB for a recognised X URL)."""
+    global _LAST_ARTICLE_ERROR
     m = ARTICLE_URL_RE.match(url)
     if not m:
         return None
-    tweet_id = m.group(1)
-    print(f"[article] detected an X Article (tweet id {tweet_id}); "
+    candidate_id = m.group("id")
+    is_i_shape = m.group("handle").lower() == "i"
+    print(f"[article] detected an X Article ({candidate_id}); "
           f"using X's internal GraphQL API — this is the fragile path, "
           f"see Section 6C ...")
 
     for attempt in range(1, _ARTICLE_ATTEMPTS + 1):
         try:
-            return _article_once(url, tweet_id)     # dict on success, None if definitively no article
+            # dict on success, None if definitively no article (sets _LAST_ARTICLE_ERROR)
+            return _article_once(url, candidate_id, is_i_shape)
         except _ArticleTransient as exc:
             if attempt < _ARTICLE_ATTEMPTS:
                 wait = 1.5 * attempt                # ~1.5s, 3s — lets X's rate limiter reset
@@ -940,6 +1083,7 @@ def article_to_article(url: str) -> "dict | None":
                       f"(attempt {attempt + 1}/{_ARTICLE_ATTEMPTS}) ...")
                 time.sleep(wait)
             else:
+                _LAST_ARTICLE_ERROR = _ARTICLE_ERROR_TRANSIENT_EXHAUSTED
                 print(f"[article] gave up after {_ARTICLE_ATTEMPTS} attempts: {exc}")
     return None
 
@@ -1216,6 +1360,29 @@ def resolve_output_path(filename: str) -> str:
 # ----------------------------------------------------------------------------
 # SECTION 12 — Main program flow
 # ----------------------------------------------------------------------------
+_ARTICLE_ERROR_MESSAGES = {
+    _ARTICLE_ERROR_NEEDS_LOGIN: (
+        "ERROR: this X Article has no public reader — X only serves Article\n"
+        "       content to a logged-in session (guest access gets HTTP 404).\n"
+        "       To read it: log into x.com in a browser, open devtools ->\n"
+        "       Application -> Cookies, copy the 'auth_token' and 'ct0' values,\n"
+        "       and save them as x_cookies.txt next to url2epub.py:\n"
+        "           auth_token=<value>\n"
+        "           ct0=<value>\n"
+        "       Then run url2epub again."),
+    _ARTICLE_ERROR_AUTH_REJECTED: (
+        "ERROR: the X session in x_cookies.txt was rejected — it has likely\n"
+        "       expired. Log into x.com again and refresh both cookie values."),
+    _ARTICLE_ERROR_NOT_FOUND: (
+        "ERROR: X has no article at that URL — it may have been deleted, made\n"
+        "       subscriber-only, or X changed its response shape."),
+    _ARTICLE_ERROR_TRANSIENT_EXHAUSTED: (
+        "ERROR: X's internal API kept failing after several retries (likely a\n"
+        "       rate limit on guest session activation). Wait a minute and try\n"
+        "       again."),
+}
+
+
 def resolve_article(url: str) -> "tuple[str, str, BeautifulSoup, str]":
     """Turn a URL into (title, author, article_soup, base_url_for_images).
        Special-site handlers (X/Twitter, X Articles) first, else the generic
@@ -1231,8 +1398,14 @@ def resolve_article(url: str) -> "tuple[str, str, BeautifulSoup, str]":
 
     # A recognised X post/article whose handler came back empty will NEVER
     # extract via the generic pipeline (X serves a JS-only shell), so falling
-    # through would just emit a misleading near-empty EPUB. Fail loudly instead.
-    if is_tweet_url(url) or is_article_url(url):
+    # through would just emit a misleading near-empty EPUB. Fail loudly instead,
+    # with the ACTUAL cause (see _LAST_ARTICLE_ERROR in Section 6C) rather than
+    # a blanket "rate limited" guess that can be wrong and unactionable.
+    if is_article_url(url):
+        reason = _LAST_ARTICLE_ERROR or _ARTICLE_ERROR_TRANSIENT_EXHAUSTED
+        sys.exit(_ARTICLE_ERROR_MESSAGES.get(
+            reason, _ARTICLE_ERROR_MESSAGES[_ARTICLE_ERROR_TRANSIENT_EXHAUSTED]))
+    if is_tweet_url(url):
         sys.exit(
             "ERROR: this is an X/Twitter post, but X's internal API could not be\n"
             "       reached — it rate-limits guest access hard. The generic reader\n"
