@@ -118,6 +118,20 @@ HEADERS = {
     "Upgrade-Insecure-Requests": "1",
 }
 
+# Fallback fingerprint (Section 4): a plain desktop Chrome UA, tried once on a
+# 403 in case the site blocks mobile UAs specifically rather than bots generally.
+_DESKTOP_HEADERS = {
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                   "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"),
+    "Accept": ("text/html,application/xhtml+xml,application/xml;q=0.9,"
+               "image/avif,image/webp,image/apng,*/*;q=0.8"),
+    "Accept-Language": "en-US,en;q=0.9",
+    "Sec-Ch-Ua": '"Google Chrome";v="125", "Chromium";v="125", "Not.A/Brand";v="24"',
+    "Sec-Ch-Ua-Mobile": "?0",
+    "Sec-Ch-Ua-Platform": '"Windows"',
+    "Upgrade-Insecure-Requests": "1",
+}
+
 JUNK_TAGS = [
     "script", "style", "noscript", "iframe", "form", "button", "input",
     "nav", "aside", "footer", "header", "svg", "video", "audio", "canvas",
@@ -270,6 +284,22 @@ def fetch_page(url: str, quiet: bool = False) -> "tuple[str, str]":
         raise FetchError(f"request failed — {exc}") from exc
 
     if resp.status_code in (401, 402, 403, 451):
+        if resp.status_code == 403:
+            # Some sites block THIS specific mobile fingerprint but allow a
+            # plain desktop Chrome one (UA-sniffing, not a real bot wall) —
+            # worth one retry before treating it as a hard block.
+            try:
+                retry = requests.get(url, headers=_DESKTOP_HEADERS,
+                                     timeout=TIMEOUT, allow_redirects=True)
+                if retry.ok and ("html" in retry.headers.get("Content-Type", "")
+                                or "xml" in retry.headers.get("Content-Type", "")):
+                    _decode(retry)
+                    if not quiet:
+                        print(f"[fetch] got {len(retry.text):,} characters of "
+                              f"HTML (desktop-UA retry after a 403).")
+                    return retry.text, retry.url
+            except requests.exceptions.RequestException:
+                pass
         raise FetchError(
             f"HTTP {resp.status_code} — access refused (paywall, login wall, "
             f"or bot protection)", status=resp.status_code, blocked=True)
@@ -327,6 +357,77 @@ def fetch_via_archive(url: str, quiet: bool = False) -> "tuple[str, str] | None"
             print(f"[archive] recovered a snapshot via {host}")
         return text, resp.url
     return None
+
+
+def fetch_via_wayback(url: str, quiet: bool = False) -> "tuple[str, str] | None":
+    """Recover a page via the Internet Archive's Wayback Machine — a public,
+       well-documented API and generally more reliable than archive.today.
+       Tried after it. Returns (html, snapshot_url) or None (no snapshot, or
+       the lookup/fetch failed)."""
+    try:
+        avail = get_session().get("https://archive.org/wayback/available",
+                                  params={"url": url}, timeout=TIMEOUT).json()
+    except (requests.exceptions.RequestException, ValueError):
+        return None
+    snap = (avail.get("archived_snapshots") or {}).get("closest") or {}
+    snap_url = snap.get("url")
+    if not snap.get("available") or not snap_url:
+        return None
+    try:
+        resp = get_session().get(snap_url, timeout=TIMEOUT, allow_redirects=True)
+    except requests.exceptions.RequestException:
+        return None
+    if not resp.ok:
+        return None
+    _decode(resp)
+    if len(resp.text) < 2000:                # "no results" / stub page
+        return None
+    if not quiet:
+        print(f"[wayback] recovered a snapshot from {snap_url}")
+    return resp.text, resp.url
+
+
+_JINA_HEADERS = {"User-Agent": "url2epub/2.0 (+personal reader)"}
+
+
+def fetch_via_jina(url: str, quiet: bool = False) -> "tuple[str, str, str] | None":
+    """Last-resort recovery via Jina Reader (r.jina.ai), which renders JS
+       server-side and returns the readable text. MUST use its own clean
+       session/UA: the shared Galaxy S24 browser fingerprint gets a 403
+       Cloudflare challenge in front of r.jina.ai (verified empirically) —
+       a plain non-browser UA is let through instead. Skips x.com entirely:
+       Jina blocks it outright with AbuseAlleviationError (verified).
+       Returns (article_html, url, title) or None."""
+    if "x.com" in url or "twitter.com" in url:
+        return None
+    try:
+        resp = requests.get(f"https://r.jina.ai/{url}", headers=_JINA_HEADERS,
+                            timeout=TIMEOUT * 2)   # server-side JS rendering is slow
+    except requests.exceptions.RequestException:
+        return None
+    if not resp.ok:
+        return None
+    _decode(resp)
+    content = resp.text.strip()
+    if len(content) < MIN_GOOD_TEXT:
+        return None
+
+    # Jina prefixes "Title: ...\nURL Source: ...\nPublished Time: ...\n\n
+    # Markdown Content:\n" before the actual body — pull the title out and
+    # strip the header so it doesn't become the article's first paragraph.
+    title_m = re.match(r"Title:\s*(.+)", content)
+    title = title_m.group(1).strip() if title_m else ""
+    marker = "Markdown Content:"
+    idx = content.find(marker)
+    body = content[idx + len(marker):].strip() if idx != -1 else content
+    if len(body) < MIN_GOOD_TEXT:
+        return None
+
+    if not quiet:
+        print(f"[jina] recovered {len(body):,} chars via Jina Reader")
+    parts = re.split(r"\n\s*\n", body)
+    html = "".join(f"<p>{xml(p.strip())}</p>" for p in parts if p.strip())
+    return html, url, title
 
 
 # ----------------------------------------------------------------------------
@@ -482,6 +583,186 @@ def find_amp_url(full_soup: BeautifulSoup, base_url: str) -> str:
     if link and link.get("href"):
         return urljoin(base_url, link["href"])
     return ""
+
+
+def extract_from_noscript(full_soup: BeautifulSoup) -> "BeautifulSoup | None":
+    """Fallback: many JS-rendered sites ship a full server-rendered copy of
+       the page inside <noscript> purely for SEO/no-JS clients. Reparse it
+       and run it through the same scorer used on the live DOM."""
+    for tag in full_soup.find_all("noscript"):
+        inner = tag.decode_contents()
+        if len(inner) < MIN_GOOD_TEXT:
+            continue
+        article = extract_main_content(BeautifulSoup(inner, PARSER))
+        if article is not None and text_len(article) >= MIN_GOOD_TEXT:
+            return article
+    return None
+
+
+# extract_from_state() false-positive guard: a fragment must clear these
+# thresholds before it's trusted as prose rather than minified JS/CSS/base64.
+_PROSE_MIN_FRAGMENT_LEN = 40
+_PROSE_SPACE_RATIO_MIN = 0.08
+_PROSE_BRACE_DENSITY_MAX = 0.02
+_PROSE_BASE64_RE = re.compile(r"^[A-Za-z0-9+/=_\-]+$")
+
+
+def _looks_like_prose(s: str) -> bool:
+    """Reject minified JS/CSS/config and base64 blobs that would otherwise
+       pass a bare length check. Validated during diagnosis: on a live page
+       this correctly ranked article prose above an inline
+       'history.scrollRestoration' script sitting in the same <script> soup."""
+    if len(s) < _PROSE_MIN_FRAGMENT_LEN:
+        return False
+    if _PROSE_BASE64_RE.match(s.replace(" ", "").replace("\n", "")):
+        return False
+    if s.count(" ") / len(s) < _PROSE_SPACE_RATIO_MIN:
+        return False
+    if (s.count("{") + s.count(";")) / len(s) > _PROSE_BRACE_DENSITY_MAX:
+        return False
+    # A long single-line string with no sentence break at all is suspicious
+    # (a URL, a long identifier list, ...); a short one may just be a single
+    # sentence with its only period at the very end, which is fine.
+    if len(s) > 250 and ". " not in s and "\n" not in s:
+        return False
+    return True
+
+
+def _walk_json_strings(obj, out: list) -> None:
+    """Recursively collect every prose-looking string in a parsed JSON blob."""
+    if isinstance(obj, str):
+        if _looks_like_prose(obj):
+            out.append(obj)
+    elif isinstance(obj, dict):
+        for v in obj.values():
+            _walk_json_strings(v, out)
+    elif isinstance(obj, list):
+        for v in obj:
+            _walk_json_strings(v, out)
+
+
+def _extract_json_blob(text: str):
+    """A <script> tag's raw text may be pure JSON, or JSON assigned to a
+       variable (window.__NEXT_DATA__ = {...};). Try a direct parse first,
+       else slice the outermost {...}/[...] and parse that."""
+    text = text.strip()
+    try:
+        return json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        pass
+    starts = [i for i in (text.find("{"), text.find("[")) if i != -1]
+    if not starts:
+        return None
+    start = min(starts)
+    end = text.rfind("}" if text[start] == "{" else "]")
+    if end <= start:
+        return None
+    try:
+        return json.loads(text[start:end + 1])
+    except (json.JSONDecodeError, ValueError):
+        return None
+
+
+def extract_from_state(full_soup: BeautifulSoup) -> "BeautifulSoup | None":
+    """Fallback: JS-rendered sites commonly embed the page's data as JSON in
+       a <script> tag under one of several framework-specific globals
+       (__NEXT_DATA__, __NUXT__, __APOLLO_STATE__, __remixContext, RSC
+       'self.__next_f' chunks, ...). Rather than one handler per framework,
+       every one of those reduces to "there's JSON in a <script>, and the
+       article is somewhere inside it" — so mine every inline <script> for
+       every prose-looking string and stitch the survivors together."""
+    found = []
+    for tag in full_soup.find_all("script"):
+        if tag.get("src"):
+            continue
+        text = tag.string or tag.get_text()
+        if not text or "{" not in text:
+            continue
+        blob = _extract_json_blob(text)
+        if blob is not None:
+            _walk_json_strings(blob, found)
+
+    seen, fragments, total = set(), [], 0
+    for s in found:
+        if s in seen:      # dual-serialized state (e.g. RSC + hydration) repeats content
+            continue
+        seen.add(s)
+        fragments.append(s)
+        total += len(s)
+    if total < MIN_GOOD_TEXT:
+        return None
+
+    parts = [s if "<" in s and ">" in s else f"<p>{xml(s)}</p>" for s in fragments]
+    return BeautifulSoup("".join(parts), PARSER)
+
+
+def find_rss_url(full_soup: BeautifulSoup, base_url: str) -> str:
+    """Locate the page's RSS/Atom feed via its <link rel="alternate"> tag."""
+    link = full_soup.find(
+        "link", rel=lambda v: v and "alternate" in v,
+        type=lambda v: v and ("rss" in v.lower() or "atom" in v.lower()))
+    if link and link.get("href"):
+        return urljoin(base_url, link["href"])
+    return ""
+
+
+_RSS_ITEM_RE = re.compile(r"<(item|entry)\b[^>]*>(.*?)</\1>", re.I | re.S)
+_RSS_HREF_RE = re.compile(r'href\s*=\s*["\']([^"\']+)["\']', re.I)
+
+
+def _rss_tag_text(block: str, tag: str) -> str:
+    """Inner text of a feed tag, unwrapping a CDATA section if present."""
+    m = re.search(rf"<{tag}\b[^>]*>(.*?)</{tag}>", block, re.I | re.S)
+    if not m:
+        return ""
+    inner = m.group(1).strip()
+    cdata = re.search(r"<!\[CDATA\[(.*?)\]\]>", inner, re.S)
+    return (cdata.group(1) if cdata else inner).strip()
+
+
+def _rss_same_url(a: str, b: str) -> bool:
+    """Loose URL match (ignores scheme/www/query/fragment/trailing slash) —
+       feed <link> entries commonly differ from the page URL only by a
+       tracking query string or a www./http vs https mismatch."""
+    def norm(u: str) -> str:
+        u = re.sub(r"^https?://(www\.)?", "", u.strip(), flags=re.I)
+        return u.split("?", 1)[0].split("#", 1)[0].rstrip("/")
+    return bool(a) and bool(b) and norm(a) == norm(b)
+
+
+def extract_from_rss(full_soup: BeautifulSoup, page_url: str,
+                     base_url: str) -> "BeautifulSoup | None":
+    """Fallback: newsletters and many blogs (Substack, Medium, Ghost) publish
+       the COMPLETE article body in their RSS/Atom feed's content:encoded (or
+       description) element — reachable even when the live page is JS-gated.
+
+       GOTCHA coded around here: html.parser treats <link> as a VOID element,
+       so a bare Atom <link>https://...</link> is unreachable via BeautifulSoup
+       with html.parser (silently broke 3/10 feeds in testing) — parsed with
+       regex over the raw feed text instead, never through bs4. The "xml"
+       parser isn't an option: it requires lxml, which this project bans."""
+    feed_url = find_rss_url(full_soup, base_url)
+    if not feed_url:
+        return None
+    try:
+        feed_text, _ = fetch_page(feed_url, quiet=True)
+    except FetchError:
+        return None
+
+    for m in _RSS_ITEM_RE.finditer(feed_text):
+        block = m.group(2)
+        link_val = _rss_tag_text(block, "link")
+        if not link_val:
+            href_m = _RSS_HREF_RE.search(block)   # Atom self-closing <link href=".."/>
+            link_val = href_m.group(1) if href_m else ""
+        if not _rss_same_url(link_val, page_url):
+            continue
+        body = (_rss_tag_text(block, "content:encoded")
+                or _rss_tag_text(block, "description"))
+        if len(body) < MIN_GOOD_TEXT:
+            return None
+        return BeautifulSoup(body, PARSER)
+    return None
 
 
 # ----------------------------------------------------------------------------
@@ -691,7 +972,7 @@ def tweet_to_article(url: str) -> "dict | None":
 # EPUB for X's JS-only shell) — it exits with a clear "try again" message.
 
 ARTICLE_URL_RE = re.compile(
-    r"^https?://(?:[\w.-]+\.)?x\.com/(?:[^/]+/article|i/article)/(\d+)",
+    r"^https?://(?:[\w.-]+\.)?x\.com/(?P<handle>[^/]+)/article/(?P<id>\d+)",
     re.IGNORECASE)
 
 # The public web client's own bearer token — stable for years, shared by
@@ -767,6 +1048,94 @@ def _x_guest_client() -> "tuple[requests.Session, ClientTransaction] | None":
     except Exception as exc:
         print(f"[article] could not establish an X session: {exc}")
         return None
+
+
+def _find_x_cookie_file() -> "str | None":
+    for candidate in (
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "x_cookies.txt"),
+        os.path.join(OUTPUT_DIR, "x_cookies.txt"),
+    ):
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def _x_auth_client() -> "tuple[requests.Session, ClientTransaction] | None":
+    """Like _x_guest_client() but authenticated with a real X session, read
+       from x_cookies.txt (two lines: auth_token=... and ct0=...), looked up
+       next to the script then in OUTPUT_DIR. Required for x.com/i/article/
+       URLs: X returns HTTP 404 for Article-entity lookups to guests
+       (verified empirically) — there is no login-free path for those.
+       Returns None silently (no file = normal, not an error) so callers can
+       fall back to an honest "needs login" message rather than crash."""
+    path = _find_x_cookie_file()
+    if path is None:
+        return None
+    cookies = {}
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, _, v = line.partition("=")
+                    cookies[k.strip()] = v.strip()
+    except OSError as exc:
+        print(f"[article] could not read x_cookies.txt: {exc}")
+        return None
+    auth_token, ct0 = cookies.get("auth_token"), cookies.get("ct0")
+    if not auth_token or not ct0:
+        print("[article] x_cookies.txt is missing auth_token or ct0 — "
+              "see CLAUDE.md for the expected format.")
+        return None
+
+    s = requests.Session()
+    s.headers.update(HEADERS)
+    adapter = HTTPAdapter(max_retries=_make_retry())
+    s.mount("https://", adapter)
+    s.mount("http://", adapter)
+    try:
+        home = s.get("https://x.com/home", timeout=TIMEOUT)
+        home_soup = BeautifulSoup(home.content, PARSER)
+        ondemand_url = get_ondemand_file_url(response=home_soup)
+        ondemand = s.get(ondemand_url, timeout=TIMEOUT)
+        ct = ClientTransaction(home_page_response=home_soup,
+                               ondemand_file_response=ondemand.text)
+        s.cookies.set("auth_token", auth_token, domain=".x.com")
+        s.cookies.set("ct0", ct0, domain=".x.com")
+        s.headers["Authorization"] = _GRAPHQL_BEARER
+        s.headers.update({
+            "x-csrf-token": ct0, "x-twitter-active-user": "yes",
+            "x-twitter-auth-type": "OAuth2Session",
+            "x-twitter-client-language": "en",
+            "Referer": "https://x.com/", "content-type": "application/json",
+        })
+        return s, ct
+    except Exception as exc:
+        print(f"[article] could not establish an authenticated X session: {exc}")
+        return None
+
+
+def _find_article_dict(obj) -> "dict | None":
+    """Recursively search a parsed GraphQL response for the Article's own
+       result dict, identified by having both 'title' and 'content_state'
+       (the shape already proven for article_results.result under
+       TweetResultByRestId). ArticleEntityResultByRestId's wrapping key is
+       UNVERIFIED — guest access 404s before ever reaching a real payload —
+       so this sidesteps guessing that key and is resilient to whatever
+       wrapper X actually uses."""
+    if isinstance(obj, dict):
+        if "title" in obj and "content_state" in obj:
+            return obj
+        for v in obj.values():
+            found = _find_article_dict(v)
+            if found is not None:
+                return found
+    elif isinstance(obj, list):
+        for item in obj:
+            found = _find_article_dict(item)
+            if found is not None:
+                return found
+    return None
 
 
 def _gql_get(s: requests.Session, ct: ClientTransaction, op_name: str,
@@ -865,32 +1234,84 @@ class _ArticleTransient(Exception):
 
 _ARTICLE_ATTEMPTS = 3   # X rate-limits guest access hard; a couple of retries with backoff clears it
 
+# Definitive (non-retryable) outcomes of an Article fetch, and the message
+# resolve_article() should show for each — see Section 12.
+_ARTICLE_ERROR_NEEDS_LOGIN = "needs_login"
+_ARTICLE_ERROR_AUTH_REJECTED = "auth_rejected"
+_ARTICLE_ERROR_NOT_FOUND = "not_found"
+_ARTICLE_ERROR_TRANSIENT_EXHAUSTED = "transient_exhausted"
+_LAST_ARTICLE_ERROR = None   # set by _article_once/article_to_article, read by resolve_article
 
-def _article_once(url: str, tweet_id: str) -> "dict | None":
+
+def _article_once(url: str, candidate_id: str, is_i_shape: bool) -> "dict | None":
     """One full X-Article fetch attempt. Returns the built dict on success,
-       None if the id definitively has no readable article, or raises
-       _ArticleTransient for a failure worth retrying."""
+       None if the id definitively has no readable article (sets
+       _LAST_ARTICLE_ERROR with why), or raises _ArticleTransient for a
+       failure worth retrying.
+
+       THE BUG THIS FIXES: an Article's own id is a DIFFERENT number from
+       any tweet that hosts it (verified empirically — real article ids
+       return an empty tweetResult from TweetResultByRestId). x.com/i/article/
+       URLs are known to carry the Article's own id. x.com/<handle>/article/
+       URLs are assumed to carry the hosting tweet's id (the historical,
+       cheaper, no-login path) but that assumption is unverified — no real
+       example of that URL shape could be found to test against. So rather
+       than hard-route by shape, we try the cheap tweet-id path first
+       whenever the shape allows it, and treat ANY empty result as proof
+       that <id> was actually an Article entity id — which requires a
+       logged-in session (guest access 404s, verified empirically)."""
+    global _LAST_ARTICLE_ERROR
+    _LAST_ARTICLE_ERROR = None
     client = _x_guest_client()
     if client is None:
         raise _ArticleTransient("could not establish an X guest session")
     s, ct = client
 
-    data = _gql_get(s, ct, "TweetResultByRestId", {
-        "tweetId": tweet_id, "withCommunity": False,
-        "includePromotedContent": False, "withVoice": False,
-    }, field_toggles=_ARTICLE_FIELD_TOGGLES)
-    if data is None:
-        raise _ArticleTransient("GraphQL request failed (HTTP error or rate limit)")
+    tweet, art = {}, None
+    if not is_i_shape:
+        data = _gql_get(s, ct, "TweetResultByRestId", {
+            "tweetId": candidate_id, "withCommunity": False,
+            "includePromotedContent": False, "withVoice": False,
+        }, field_toggles=_ARTICLE_FIELD_TOGGLES)
+        if data is None:
+            raise _ArticleTransient("GraphQL request failed (HTTP error or rate limit)")
+        tweet = (data.get("data") or {}).get("tweetResult", {}).get("result", {}) or {}
+        if not tweet and data.get("errors"):
+            # No result at all + an errors array => usually a rate-limit/auth
+            # blip, not a genuinely article-less tweet. Worth another attempt.
+            raise _ArticleTransient(
+                f"X returned an error: {data['errors'][0].get('message', 'unknown')}")
+        art = ((tweet.get("article") or {}).get("article_results") or {}).get("result")
 
-    tweet = (data.get("data") or {}).get("tweetResult", {}).get("result", {}) or {}
-    if not tweet and data.get("errors"):
-        # No result at all + an errors array => usually a rate-limit/auth blip,
-        # not a genuinely article-less tweet. Worth another attempt.
-        raise _ArticleTransient(
-            f"X returned an error: {data['errors'][0].get('message', 'unknown')}")
-
-    art = ((tweet.get("article") or {}).get("article_results") or {}).get("result")
     if not art:
+        # Either an i/article/ URL, or the tweet-id guess came back empty —
+        # both mean <candidate_id> is the Article's own entity id, which X
+        # only serves to an authenticated session.
+        auth = _x_auth_client()
+        if auth is None:
+            _LAST_ARTICLE_ERROR = _ARTICLE_ERROR_NEEDS_LOGIN
+            print("[article] this Article has no guest-readable API — a "
+                  "logged-in X session is required (see CLAUDE.md for "
+                  "x_cookies.txt setup).")
+            return None
+        s, ct = auth
+        data = _gql_get(s, ct, "ArticleEntityResultByRestId",
+                        {"articleId": candidate_id},
+                        field_toggles={"withPayments": False,
+                                       "withAuxiliaryUserLabels": False})
+        if data is None:
+            raise _ArticleTransient("authenticated GraphQL request failed")
+        if data.get("errors"):
+            _LAST_ARTICLE_ERROR = _ARTICLE_ERROR_AUTH_REJECTED
+            print(f"[article] the authenticated session was rejected "
+                  f"({data['errors'][0].get('message', 'unknown')}) — the "
+                  f"session in x_cookies.txt has likely expired; refresh it.")
+            return None
+        art = _find_article_dict(data.get("data") or {})
+        tweet = {}   # no hosting-tweet metadata available on this path
+
+    if not art:
+        _LAST_ARTICLE_ERROR = _ARTICLE_ERROR_NOT_FOUND
         print("[article] no article content on that id — may be deleted, "
               "subscriber-only, or X changed its response shape.")
         return None
@@ -922,17 +1343,20 @@ def article_to_article(url: str) -> "dict | None":
        only on a definitive miss or after all attempts are exhausted, so
        resolve_article() can then react (see there — it no longer silently
        emits an empty EPUB for a recognised X URL)."""
+    global _LAST_ARTICLE_ERROR
     m = ARTICLE_URL_RE.match(url)
     if not m:
         return None
-    tweet_id = m.group(1)
-    print(f"[article] detected an X Article (tweet id {tweet_id}); "
+    candidate_id = m.group("id")
+    is_i_shape = m.group("handle").lower() == "i"
+    print(f"[article] detected an X Article ({candidate_id}); "
           f"using X's internal GraphQL API — this is the fragile path, "
           f"see Section 6C ...")
 
     for attempt in range(1, _ARTICLE_ATTEMPTS + 1):
         try:
-            return _article_once(url, tweet_id)     # dict on success, None if definitively no article
+            # dict on success, None if definitively no article (sets _LAST_ARTICLE_ERROR)
+            return _article_once(url, candidate_id, is_i_shape)
         except _ArticleTransient as exc:
             if attempt < _ARTICLE_ATTEMPTS:
                 wait = 1.5 * attempt                # ~1.5s, 3s — lets X's rate limiter reset
@@ -940,6 +1364,7 @@ def article_to_article(url: str) -> "dict | None":
                       f"(attempt {attempt + 1}/{_ARTICLE_ATTEMPTS}) ...")
                 time.sleep(wait)
             else:
+                _LAST_ARTICLE_ERROR = _ARTICLE_ERROR_TRANSIENT_EXHAUSTED
                 print(f"[article] gave up after {_ARTICLE_ATTEMPTS} attempts: {exc}")
     return None
 
@@ -1216,6 +1641,54 @@ def resolve_output_path(filename: str) -> str:
 # ----------------------------------------------------------------------------
 # SECTION 12 — Main program flow
 # ----------------------------------------------------------------------------
+def _candidate_quality(candidate: "BeautifulSoup | None") -> float:
+    """One-line quality heuristic used to keep the BEST local extraction
+       candidate instead of the first one that merely clears MIN_GOOD_TEXT —
+       stops a short, link-heavy nav block from beating real article prose,
+       the only failure mode raw character count has. Deliberately not a
+       multi-signal scorer: both text_len and link_density already exist and
+       are already used by score_container, so this adds no new machinery."""
+    if candidate is None:
+        return 0.0
+    return text_len(candidate) * (1.0 - link_density(candidate))
+
+
+def _is_truncated(candidate: "BeautifulSoup | None", ld: dict) -> bool:
+    """JSON-LD sometimes advertises the page's true wordCount; if what we
+       extracted is far short of it, the candidate is a "continue reading"
+       truncation, not the full article, even though it cleared MIN_GOOD_TEXT."""
+    if candidate is None:
+        return False
+    word_count = ld.get("wordCount")
+    if not isinstance(word_count, (int, float)) or word_count <= 0:
+        return False
+    got_words = len(candidate.get_text(" ", strip=True).split())
+    return got_words < word_count * 0.5
+
+
+_ARTICLE_ERROR_MESSAGES = {
+    _ARTICLE_ERROR_NEEDS_LOGIN: (
+        "ERROR: this X Article has no public reader — X only serves Article\n"
+        "       content to a logged-in session (guest access gets HTTP 404).\n"
+        "       To read it: log into x.com in a browser, open devtools ->\n"
+        "       Application -> Cookies, copy the 'auth_token' and 'ct0' values,\n"
+        "       and save them as x_cookies.txt next to url2epub.py:\n"
+        "           auth_token=<value>\n"
+        "           ct0=<value>\n"
+        "       Then run url2epub again."),
+    _ARTICLE_ERROR_AUTH_REJECTED: (
+        "ERROR: the X session in x_cookies.txt was rejected — it has likely\n"
+        "       expired. Log into x.com again and refresh both cookie values."),
+    _ARTICLE_ERROR_NOT_FOUND: (
+        "ERROR: X has no article at that URL — it may have been deleted, made\n"
+        "       subscriber-only, or X changed its response shape."),
+    _ARTICLE_ERROR_TRANSIENT_EXHAUSTED: (
+        "ERROR: X's internal API kept failing after several retries (likely a\n"
+        "       rate limit on guest session activation). Wait a minute and try\n"
+        "       again."),
+}
+
+
 def resolve_article(url: str) -> "tuple[str, str, BeautifulSoup, str]":
     """Turn a URL into (title, author, article_soup, base_url_for_images).
        Special-site handlers (X/Twitter, X Articles) first, else the generic
@@ -1231,8 +1704,14 @@ def resolve_article(url: str) -> "tuple[str, str, BeautifulSoup, str]":
 
     # A recognised X post/article whose handler came back empty will NEVER
     # extract via the generic pipeline (X serves a JS-only shell), so falling
-    # through would just emit a misleading near-empty EPUB. Fail loudly instead.
-    if is_tweet_url(url) or is_article_url(url):
+    # through would just emit a misleading near-empty EPUB. Fail loudly instead,
+    # with the ACTUAL cause (see _LAST_ARTICLE_ERROR in Section 6C) rather than
+    # a blanket "rate limited" guess that can be wrong and unactionable.
+    if is_article_url(url):
+        reason = _LAST_ARTICLE_ERROR or _ARTICLE_ERROR_TRANSIENT_EXHAUSTED
+        sys.exit(_ARTICLE_ERROR_MESSAGES.get(
+            reason, _ARTICLE_ERROR_MESSAGES[_ARTICLE_ERROR_TRANSIENT_EXHAUSTED]))
+    if is_tweet_url(url):
         sys.exit(
             "ERROR: this is an X/Twitter post, but X's internal API could not be\n"
             "       reached — it rate-limits guest access hard. The generic reader\n"
@@ -1245,20 +1724,37 @@ def resolve_article(url: str) -> "tuple[str, str, BeautifulSoup, str]":
     try:
         html, final_url = fetch_page(url)
     except FetchError as exc:
-        # A blocked page (paywall/login/bot wall) is worth one archive.today
-        # attempt before we give up; any other error is a hard stop.
-        if exc.blocked:
-            print(f"[fetch] {exc}")
-            print("[archive] blocked — trying archive.today snapshot ...")
-            snap = fetch_via_archive(url)
-            if snap is None:
-                sys.exit(f"ERROR: {exc}\n"
-                         f"       No archive.today snapshot was available "
-                         f"either — this page needs a login or a real browser.")
-            html, final_url = snap
-            used_archive = True
-        else:
+        # A blocked page (paywall/login/bot wall) is worth archive.today,
+        # Wayback, and Jina attempts before we give up; any other error is a
+        # hard stop.
+        if not exc.blocked:
             sys.exit(f"ERROR: {exc}")
+        print(f"[fetch] {exc}")
+        print("[archive] blocked — trying archive.today snapshot ...")
+        snap = fetch_via_archive(url)
+        if snap is None:
+            print("[wayback] trying the Wayback Machine ...")
+            snap = fetch_via_wayback(url)
+        if snap is None:
+            print("[jina] trying Jina Reader ...")
+            jina = fetch_via_jina(url)
+            if jina is None:
+                sys.exit(f"ERROR: {exc}\n"
+                         f"       No archive.today/Wayback snapshot was available "
+                         f"and Jina Reader also failed — this page needs a "
+                         f"login or a real browser.")
+            # Jina hands back an already-built article (not a raw page), so
+            # skip the rest of the pipeline and return straight away.
+            jina_html, jina_url, jina_title = jina
+            article = BeautifulSoup(jina_html, PARSER)
+            title = jina_title or "Untitled Article"
+            print(f"[meta ] title : {title}")
+            print("[meta ] author: (not found)")
+            print(f"[extract] clean article text: {text_len(article):,} "
+                  f"characters (via Jina Reader).")
+            return title, "", article, jina_url
+        html, final_url = snap
+        used_archive = True
     if not used_archive and final_url != url:
         print(f"[fetch] redirected to {final_url}")
 
@@ -1269,14 +1765,34 @@ def resolve_article(url: str) -> "tuple[str, str, BeautifulSoup, str]":
     print(f"[meta ] title : {title}")
     print(f"[meta ] author: {author or '(not found)'}")
 
-    # Extraction fallback chain: scorer → JSON-LD → AMP → archive → interactive.
-    article = extract_main_content(full_soup)
-    if article is None or text_len(article) < MIN_GOOD_TEXT:
-        print("[extract] DOM scoring weak — trying JSON-LD articleBody ...")
-        ld_article = jsonld_body_to_soup(ld)
-        if ld_article is not None:
-            article = ld_article
-            print("[extract] recovered full text from JSON-LD metadata.")
+    # Extraction fallback chain: local strategies (keep BEST, not first-past-
+    # 500) → AMP → archive → interactive. The local stage used to accept the
+    # FIRST candidate to clear MIN_GOOD_TEXT, which let a weak-but-passing
+    # extraction block a genuinely better one from ever running.
+    candidates = []
+    for label, candidate in (("DOM scoring", extract_main_content(full_soup)),
+                             ("JSON-LD articleBody", jsonld_body_to_soup(ld))):
+        if candidate is not None:
+            candidates.append((label, candidate))
+    best_label, article = max(
+        candidates, key=lambda c: _candidate_quality(c[1]), default=(None, None))
+
+    if article is None or text_len(article) < MIN_GOOD_TEXT or _is_truncated(article, ld):
+        print("[extract] DOM/JSON-LD weak or truncated — trying <noscript>, "
+              "embedded JSON state, and RSS full text ...")
+        for label, candidate in (
+            ("<noscript>", extract_from_noscript(full_soup)),
+            ("embedded JSON state", extract_from_state(full_soup)),
+            ("RSS full text", extract_from_rss(full_soup, final_url, final_url)),
+        ):
+            if candidate is not None:
+                candidates.append((label, candidate))
+        best_label, article = max(
+            candidates, key=lambda c: _candidate_quality(c[1]), default=(None, None))
+
+    if article is not None:
+        print(f"[extract] best local candidate: {best_label} "
+              f"({text_len(article):,} chars).")
 
     if article is None or text_len(article) < MIN_GOOD_TEXT:
         amp = find_amp_url(full_soup, final_url)
@@ -1310,6 +1826,34 @@ def resolve_article(url: str) -> "tuple[str, str, BeautifulSoup, str]":
                 if not author:
                     author = detect_author(snap_soup, snap_ld)
                 print("[extract] recovered article from archive.today.")
+
+    if article is None or text_len(article) < MIN_GOOD_TEXT:
+        print("[extract] still weak — trying the Wayback Machine ...")
+        wb = fetch_via_wayback(url)
+        if wb is not None:
+            wb_html, wb_url = wb
+            wb_soup = BeautifulSoup(wb_html, PARSER)
+            wb_article = extract_main_content(wb_soup)
+            if wb_article is not None and text_len(wb_article) >= MIN_GOOD_TEXT:
+                article = wb_article
+                final_url = wb_url          # images resolve against the snapshot
+                wb_ld = find_jsonld_article(wb_soup)
+                if title in ("", "Untitled Article"):
+                    title = detect_title(wb_soup, wb_ld)
+                if not author:
+                    author = detect_author(wb_soup, wb_ld)
+                print("[extract] recovered article from the Wayback Machine.")
+
+    if article is None or text_len(article) < MIN_GOOD_TEXT:
+        print("[extract] still weak — trying Jina Reader ...")
+        jina = fetch_via_jina(url)
+        if jina is not None:
+            jina_html, jina_url, jina_title = jina
+            article = BeautifulSoup(jina_html, PARSER)
+            final_url = jina_url
+            if title in ("", "Untitled Article") and jina_title:
+                title = jina_title
+            print("[extract] recovered article via Jina Reader.")
 
     if article is None or text_len(article) < MIN_GOOD_TEXT:
         print("\n[!] Extraction looks WEAK (very little text found).")
