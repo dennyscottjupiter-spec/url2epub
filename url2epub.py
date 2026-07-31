@@ -1540,6 +1540,31 @@ def resolve_output_path(filename: str) -> str:
 # ----------------------------------------------------------------------------
 # SECTION 12 — Main program flow
 # ----------------------------------------------------------------------------
+def _candidate_quality(candidate: "BeautifulSoup | None") -> float:
+    """One-line quality heuristic used to keep the BEST local extraction
+       candidate instead of the first one that merely clears MIN_GOOD_TEXT —
+       stops a short, link-heavy nav block from beating real article prose,
+       the only failure mode raw character count has. Deliberately not a
+       multi-signal scorer: both text_len and link_density already exist and
+       are already used by score_container, so this adds no new machinery."""
+    if candidate is None:
+        return 0.0
+    return text_len(candidate) * (1.0 - link_density(candidate))
+
+
+def _is_truncated(candidate: "BeautifulSoup | None", ld: dict) -> bool:
+    """JSON-LD sometimes advertises the page's true wordCount; if what we
+       extracted is far short of it, the candidate is a "continue reading"
+       truncation, not the full article, even though it cleared MIN_GOOD_TEXT."""
+    if candidate is None:
+        return False
+    word_count = ld.get("wordCount")
+    if not isinstance(word_count, (int, float)) or word_count <= 0:
+        return False
+    got_words = len(candidate.get_text(" ", strip=True).split())
+    return got_words < word_count * 0.5
+
+
 _ARTICLE_ERROR_MESSAGES = {
     _ARTICLE_ERROR_NEEDS_LOGIN: (
         "ERROR: this X Article has no public reader — X only serves Article\n"
@@ -1622,14 +1647,34 @@ def resolve_article(url: str) -> "tuple[str, str, BeautifulSoup, str]":
     print(f"[meta ] title : {title}")
     print(f"[meta ] author: {author or '(not found)'}")
 
-    # Extraction fallback chain: scorer → JSON-LD → AMP → archive → interactive.
-    article = extract_main_content(full_soup)
-    if article is None or text_len(article) < MIN_GOOD_TEXT:
-        print("[extract] DOM scoring weak — trying JSON-LD articleBody ...")
-        ld_article = jsonld_body_to_soup(ld)
-        if ld_article is not None:
-            article = ld_article
-            print("[extract] recovered full text from JSON-LD metadata.")
+    # Extraction fallback chain: local strategies (keep BEST, not first-past-
+    # 500) → AMP → archive → interactive. The local stage used to accept the
+    # FIRST candidate to clear MIN_GOOD_TEXT, which let a weak-but-passing
+    # extraction block a genuinely better one from ever running.
+    candidates = []
+    for label, candidate in (("DOM scoring", extract_main_content(full_soup)),
+                             ("JSON-LD articleBody", jsonld_body_to_soup(ld))):
+        if candidate is not None:
+            candidates.append((label, candidate))
+    best_label, article = max(
+        candidates, key=lambda c: _candidate_quality(c[1]), default=(None, None))
+
+    if article is None or text_len(article) < MIN_GOOD_TEXT or _is_truncated(article, ld):
+        print("[extract] DOM/JSON-LD weak or truncated — trying <noscript>, "
+              "embedded JSON state, and RSS full text ...")
+        for label, candidate in (
+            ("<noscript>", extract_from_noscript(full_soup)),
+            ("embedded JSON state", extract_from_state(full_soup)),
+            ("RSS full text", extract_from_rss(full_soup, final_url, final_url)),
+        ):
+            if candidate is not None:
+                candidates.append((label, candidate))
+        best_label, article = max(
+            candidates, key=lambda c: _candidate_quality(c[1]), default=(None, None))
+
+    if article is not None:
+        print(f"[extract] best local candidate: {best_label} "
+              f"({text_len(article):,} chars).")
 
     if article is None or text_len(article) < MIN_GOOD_TEXT:
         amp = find_amp_url(full_soup, final_url)
