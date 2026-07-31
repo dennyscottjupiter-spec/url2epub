@@ -595,6 +595,75 @@ def extract_from_state(full_soup: BeautifulSoup) -> "BeautifulSoup | None":
     return BeautifulSoup("".join(parts), PARSER)
 
 
+def find_rss_url(full_soup: BeautifulSoup, base_url: str) -> str:
+    """Locate the page's RSS/Atom feed via its <link rel="alternate"> tag."""
+    link = full_soup.find(
+        "link", rel=lambda v: v and "alternate" in v,
+        type=lambda v: v and ("rss" in v.lower() or "atom" in v.lower()))
+    if link and link.get("href"):
+        return urljoin(base_url, link["href"])
+    return ""
+
+
+_RSS_ITEM_RE = re.compile(r"<(item|entry)\b[^>]*>(.*?)</\1>", re.I | re.S)
+_RSS_HREF_RE = re.compile(r'href\s*=\s*["\']([^"\']+)["\']', re.I)
+
+
+def _rss_tag_text(block: str, tag: str) -> str:
+    """Inner text of a feed tag, unwrapping a CDATA section if present."""
+    m = re.search(rf"<{tag}\b[^>]*>(.*?)</{tag}>", block, re.I | re.S)
+    if not m:
+        return ""
+    inner = m.group(1).strip()
+    cdata = re.search(r"<!\[CDATA\[(.*?)\]\]>", inner, re.S)
+    return (cdata.group(1) if cdata else inner).strip()
+
+
+def _rss_same_url(a: str, b: str) -> bool:
+    """Loose URL match (ignores scheme/www/query/fragment/trailing slash) —
+       feed <link> entries commonly differ from the page URL only by a
+       tracking query string or a www./http vs https mismatch."""
+    def norm(u: str) -> str:
+        u = re.sub(r"^https?://(www\.)?", "", u.strip(), flags=re.I)
+        return u.split("?", 1)[0].split("#", 1)[0].rstrip("/")
+    return bool(a) and bool(b) and norm(a) == norm(b)
+
+
+def extract_from_rss(full_soup: BeautifulSoup, page_url: str,
+                     base_url: str) -> "BeautifulSoup | None":
+    """Fallback: newsletters and many blogs (Substack, Medium, Ghost) publish
+       the COMPLETE article body in their RSS/Atom feed's content:encoded (or
+       description) element — reachable even when the live page is JS-gated.
+
+       GOTCHA coded around here: html.parser treats <link> as a VOID element,
+       so a bare Atom <link>https://...</link> is unreachable via BeautifulSoup
+       with html.parser (silently broke 3/10 feeds in testing) — parsed with
+       regex over the raw feed text instead, never through bs4. The "xml"
+       parser isn't an option: it requires lxml, which this project bans."""
+    feed_url = find_rss_url(full_soup, base_url)
+    if not feed_url:
+        return None
+    try:
+        feed_text, _ = fetch_page(feed_url, quiet=True)
+    except FetchError:
+        return None
+
+    for m in _RSS_ITEM_RE.finditer(feed_text):
+        block = m.group(2)
+        link_val = _rss_tag_text(block, "link")
+        if not link_val:
+            href_m = _RSS_HREF_RE.search(block)   # Atom self-closing <link href=".."/>
+            link_val = href_m.group(1) if href_m else ""
+        if not _rss_same_url(link_val, page_url):
+            continue
+        body = (_rss_tag_text(block, "content:encoded")
+                or _rss_tag_text(block, "description"))
+        if len(body) < MIN_GOOD_TEXT:
+            return None
+        return BeautifulSoup(body, PARSER)
+    return None
+
+
 # ----------------------------------------------------------------------------
 # SECTION 6B — Special-site handler: X / Twitter
 # ----------------------------------------------------------------------------
