@@ -118,6 +118,20 @@ HEADERS = {
     "Upgrade-Insecure-Requests": "1",
 }
 
+# Fallback fingerprint (Section 4): a plain desktop Chrome UA, tried once on a
+# 403 in case the site blocks mobile UAs specifically rather than bots generally.
+_DESKTOP_HEADERS = {
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                   "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"),
+    "Accept": ("text/html,application/xhtml+xml,application/xml;q=0.9,"
+               "image/avif,image/webp,image/apng,*/*;q=0.8"),
+    "Accept-Language": "en-US,en;q=0.9",
+    "Sec-Ch-Ua": '"Google Chrome";v="125", "Chromium";v="125", "Not.A/Brand";v="24"',
+    "Sec-Ch-Ua-Mobile": "?0",
+    "Sec-Ch-Ua-Platform": '"Windows"',
+    "Upgrade-Insecure-Requests": "1",
+}
+
 JUNK_TAGS = [
     "script", "style", "noscript", "iframe", "form", "button", "input",
     "nav", "aside", "footer", "header", "svg", "video", "audio", "canvas",
@@ -270,6 +284,22 @@ def fetch_page(url: str, quiet: bool = False) -> "tuple[str, str]":
         raise FetchError(f"request failed — {exc}") from exc
 
     if resp.status_code in (401, 402, 403, 451):
+        if resp.status_code == 403:
+            # Some sites block THIS specific mobile fingerprint but allow a
+            # plain desktop Chrome one (UA-sniffing, not a real bot wall) —
+            # worth one retry before treating it as a hard block.
+            try:
+                retry = requests.get(url, headers=_DESKTOP_HEADERS,
+                                     timeout=TIMEOUT, allow_redirects=True)
+                if retry.ok and ("html" in retry.headers.get("Content-Type", "")
+                                or "xml" in retry.headers.get("Content-Type", "")):
+                    _decode(retry)
+                    if not quiet:
+                        print(f"[fetch] got {len(retry.text):,} characters of "
+                              f"HTML (desktop-UA retry after a 403).")
+                    return retry.text, retry.url
+            except requests.exceptions.RequestException:
+                pass
         raise FetchError(
             f"HTTP {resp.status_code} — access refused (paywall, login wall, "
             f"or bot protection)", status=resp.status_code, blocked=True)
@@ -327,6 +357,65 @@ def fetch_via_archive(url: str, quiet: bool = False) -> "tuple[str, str] | None"
             print(f"[archive] recovered a snapshot via {host}")
         return text, resp.url
     return None
+
+
+def fetch_via_wayback(url: str, quiet: bool = False) -> "tuple[str, str] | None":
+    """Recover a page via the Internet Archive's Wayback Machine — a public,
+       well-documented API and generally more reliable than archive.today.
+       Tried after it. Returns (html, snapshot_url) or None (no snapshot, or
+       the lookup/fetch failed)."""
+    try:
+        avail = get_session().get("https://archive.org/wayback/available",
+                                  params={"url": url}, timeout=TIMEOUT).json()
+    except (requests.exceptions.RequestException, ValueError):
+        return None
+    snap = (avail.get("archived_snapshots") or {}).get("closest") or {}
+    snap_url = snap.get("url")
+    if not snap.get("available") or not snap_url:
+        return None
+    try:
+        resp = get_session().get(snap_url, timeout=TIMEOUT, allow_redirects=True)
+    except requests.exceptions.RequestException:
+        return None
+    if not resp.ok:
+        return None
+    _decode(resp)
+    if len(resp.text) < 2000:                # "no results" / stub page
+        return None
+    if not quiet:
+        print(f"[wayback] recovered a snapshot from {snap_url}")
+    return resp.text, resp.url
+
+
+_JINA_HEADERS = {"User-Agent": "url2epub/2.0 (+personal reader)"}
+
+
+def fetch_via_jina(url: str, quiet: bool = False) -> "tuple[str, str] | None":
+    """Last-resort recovery via Jina Reader (r.jina.ai), which renders JS
+       server-side and returns the readable text. MUST use its own clean
+       session/UA: the shared Galaxy S24 browser fingerprint gets a 403
+       Cloudflare challenge in front of r.jina.ai (verified empirically) —
+       a plain non-browser UA is let through instead. Skips x.com entirely:
+       Jina blocks it outright with AbuseAlleviationError (verified)."""
+    if "x.com" in url or "twitter.com" in url:
+        return None
+    try:
+        resp = requests.get(f"https://r.jina.ai/{url}", headers=_JINA_HEADERS,
+                            timeout=TIMEOUT * 2)   # server-side JS rendering is slow
+    except requests.exceptions.RequestException:
+        return None
+    if not resp.ok:
+        return None
+    _decode(resp)
+    content = resp.text.strip()
+    if len(content) < MIN_GOOD_TEXT:
+        return None
+    if not quiet:
+        print(f"[jina] recovered {len(content):,} chars via Jina Reader")
+    # Jina's response is markdown/plain text, not HTML — wrap it as paragraphs.
+    parts = re.split(r"\n\s*\n", content)
+    html = "".join(f"<p>{xml(p.strip())}</p>" for p in parts if p.strip())
+    return html, url
 
 
 # ----------------------------------------------------------------------------
@@ -1708,6 +1797,32 @@ def resolve_article(url: str) -> "tuple[str, str, BeautifulSoup, str]":
                 if not author:
                     author = detect_author(snap_soup, snap_ld)
                 print("[extract] recovered article from archive.today.")
+
+    if article is None or text_len(article) < MIN_GOOD_TEXT:
+        print("[extract] still weak — trying the Wayback Machine ...")
+        wb = fetch_via_wayback(url)
+        if wb is not None:
+            wb_html, wb_url = wb
+            wb_soup = BeautifulSoup(wb_html, PARSER)
+            wb_article = extract_main_content(wb_soup)
+            if wb_article is not None and text_len(wb_article) >= MIN_GOOD_TEXT:
+                article = wb_article
+                final_url = wb_url          # images resolve against the snapshot
+                wb_ld = find_jsonld_article(wb_soup)
+                if title in ("", "Untitled Article"):
+                    title = detect_title(wb_soup, wb_ld)
+                if not author:
+                    author = detect_author(wb_soup, wb_ld)
+                print("[extract] recovered article from the Wayback Machine.")
+
+    if article is None or text_len(article) < MIN_GOOD_TEXT:
+        print("[extract] still weak — trying Jina Reader ...")
+        jina = fetch_via_jina(url)
+        if jina is not None:
+            jina_html, jina_url = jina
+            article = BeautifulSoup(jina_html, PARSER)
+            final_url = jina_url
+            print("[extract] recovered article via Jina Reader.")
 
     if article is None or text_len(article) < MIN_GOOD_TEXT:
         print("\n[!] Extraction looks WEAK (very little text found).")
