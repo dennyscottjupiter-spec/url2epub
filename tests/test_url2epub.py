@@ -186,6 +186,20 @@ def test_detect_author_variants():
     assert u.detect_author(soup('<span class="byline">By Cy</span>'), {}) == "Cy"
 
 
+def test_bare_by_byline_is_not_an_author():
+    assert u.detect_author(soup('<span class="byline">by</span>'), {}) == ""
+    assert u.detect_author(soup('<span class="byline">Byron Kay</span>'), {}) == "Byron Kay"
+
+
+def test_i_article_without_cookies_needs_login_and_skips_guest(monkeypatch):
+    def no_guest():
+        raise AssertionError("guest session must not be built for i/article/ ids")
+    monkeypatch.setattr(u, "_x_guest_client", no_guest)
+    monkeypatch.setattr(u, "_x_auth_client", lambda: None)
+    assert u.article_to_article("https://x.com/i/article/123") is None
+    assert u._LAST_ARTICLE_ERROR == u._ARTICLE_ERROR_NEEDS_LOGIN
+
+
 def test_extract_main_content_picks_article():
     html = ("<nav>" + "<a href='#'>link</a>" * 50 + "</nav>"
             "<div class='content'>" + "<p>This is a long, real, paragraph of prose text.</p>" * 30

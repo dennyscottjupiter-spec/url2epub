@@ -527,7 +527,7 @@ def detect_author(soup: BeautifulSoup, ld: dict) -> str:
 
     byline = soup.find(class_=re.compile(r"\b(byline|author)\b", re.I))
     if byline:
-        t = re.sub(r"^\s*by[:\s]+", "",
+        t = re.sub(r"^\s*by\b[:\s]*", "",   # a bare "by" byline → empty
                    byline.get_text(" ", strip=True), flags=re.I).strip()
         if 0 < len(t) <= 100:
             return t
@@ -1290,13 +1290,12 @@ def _article_once(url: str, candidate_id: str, is_i_shape: bool) -> "dict | None
        logged-in session (guest access 404s, verified empirically)."""
     global _LAST_ARTICLE_ERROR
     _LAST_ARTICLE_ERROR = None
-    client = _x_guest_client()
-    if client is None:
-        raise _ArticleTransient("could not establish an X guest session")
-    s, ct = client
-
     tweet, art = {}, None
-    if not is_i_shape:
+    if not is_i_shape:   # i/article/ ids skip the guest path entirely
+        client = _x_guest_client()
+        if client is None:
+            raise _ArticleTransient("could not establish an X guest session")
+        s, ct = client
         data = _gql_get(s, ct, "TweetResultByRestId", {
             "tweetId": candidate_id, "withCommunity": False,
             "includePromotedContent": False, "withVoice": False,
@@ -1733,9 +1732,10 @@ _ARTICLE_ERROR_MESSAGES = {
         "ERROR: X has no article at that URL — it may have been deleted, made\n"
         "       subscriber-only, or X changed its response shape."),
     _ARTICLE_ERROR_TRANSIENT_EXHAUSTED: (
-        "ERROR: X's internal API kept failing after several retries (likely a\n"
-        "       rate limit on guest session activation). Wait a minute and try\n"
-        "       again."),
+        "ERROR: X's internal API kept failing after several retries. Either X\n"
+        "       is rate-limiting guest sessions (wait a minute and try again) or\n"
+        "       X changed its page format, which breaks the xclienttransaction\n"
+        "       library (see the [article] lines above; needs a library update)."),
 }
 
 
