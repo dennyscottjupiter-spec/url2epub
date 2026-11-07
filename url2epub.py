@@ -203,9 +203,14 @@ def text_len(soup_or_tag) -> int:
     return len(soup_or_tag.get_text(separator=" ", strip=True))
 
 
+# C0 control chars (except tab/LF/CR) are illegal anywhere in XML 1.0 — one
+# stray \x0b from a scraped page makes the whole EPUB file unreadable.
+_XML_ILLEGAL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f￾￿]")
+
+
 def xml(s: str) -> str:
     """Escape a string so it is safe inside XML/XHTML markup."""
-    return escape(s or "", quote=True)
+    return escape(_XML_ILLEGAL.sub("", s or ""), quote=True)
 
 
 # ----------------------------------------------------------------------------
@@ -286,20 +291,31 @@ def fetch_page(url: str, quiet: bool = False) -> "tuple[str, str]":
     if resp.status_code in (401, 402, 403, 451):
         if resp.status_code == 403:
             # Some sites block THIS specific mobile fingerprint but allow a
-            # plain desktop Chrome one (UA-sniffing, not a real bot wall) —
-            # worth one retry before treating it as a hard block.
-            try:
-                retry = requests.get(url, headers=_DESKTOP_HEADERS,
-                                     timeout=TIMEOUT, allow_redirects=True)
-                if retry.ok and ("html" in retry.headers.get("Content-Type", "")
-                                or "xml" in retry.headers.get("Content-Type", "")):
+            # plain desktop Chrome one (UA-sniffing, not a real bot wall);
+            # others (Wikipedia, verified) 403 every browser-looking UA yet
+            # accept an honest bot UA — try both before calling it a block.
+            for label, hdrs in (("desktop-UA", _DESKTOP_HEADERS),
+                                ("plain-UA", _JINA_HEADERS)):
+                try:
+                    retry = requests.get(url, headers=hdrs,
+                                         timeout=TIMEOUT, allow_redirects=True)
+                except requests.exceptions.RequestException:
+                    continue
+                rtype = retry.headers.get("Content-Type", "")
+                # The retry got past the wall and told the truth: a missing
+                # page or a non-HTML file must NOT go on to archive/Jina
+                # (they'd happily turn a "page not found" into an EPUB).
+                if retry.status_code == 404:
+                    raise FetchError("HTTP 404 — page not found. Check the URL.",
+                                     status=404)
+                if retry.ok and "html" not in rtype and "xml" not in rtype:
+                    raise FetchError(f"URL returned '{rtype}', not a web page.")
+                if retry.ok and ("html" in rtype or "xml" in rtype):
                     _decode(retry)
                     if not quiet:
                         print(f"[fetch] got {len(retry.text):,} characters of "
-                              f"HTML (desktop-UA retry after a 403).")
+                              f"HTML ({label} retry after a 403).")
                     return retry.text, retry.url
-            except requests.exceptions.RequestException:
-                pass
         raise FetchError(
             f"HTTP {resp.status_code} — access refused (paywall, login wall, "
             f"or bot protection)", status=resp.status_code, blocked=True)
@@ -338,8 +354,12 @@ def fetch_via_archive(url: str, quiet: bool = False) -> "tuple[str, str] | None"
     for host in ARCHIVE_HOSTS:
         snapshot = f"{host}/newest/{url}"
         try:
-            resp = get_session().get(snapshot, timeout=TIMEOUT,
-                                     allow_redirects=True)
+            # No retrying session here: archive.today often stalls instead of
+            # refusing, and 4 tries x 30s x 3 mirrors froze a run for ~7 min.
+            resp = requests.get(snapshot, headers=HEADERS, timeout=TIMEOUT,
+                                allow_redirects=True)
+        except requests.exceptions.Timeout:
+            break                           # same operator: if one stalls, all do
         except requests.exceptions.RequestException:
             continue                        # host down → try the next mirror
         if resp.status_code != 200:
@@ -398,7 +418,8 @@ def fetch_via_jina(url: str, quiet: bool = False) -> "tuple[str, str, str] | Non
        a plain non-browser UA is let through instead. Skips x.com entirely:
        Jina blocks it outright with AbuseAlleviationError (verified).
        Returns (article_html, url, title) or None."""
-    if "x.com" in url or "twitter.com" in url:
+    host = (urlparse(url).hostname or "").lower()
+    if re.search(r"(^|\.)(x|twitter)\.com$", host):   # not netflix.com etc.
         return None
     try:
         resp = requests.get(f"https://r.jina.ai/{url}", headers=_JINA_HEADERS,
@@ -468,7 +489,13 @@ def detect_title(soup: BeautifulSoup, ld: dict) -> str:
         candidates.append(og.get("content", ""))
     h1 = soup.find("h1")
     if h1:
-        candidates.append(h1.get_text(" ", strip=True))
+        h1_text = h1.get_text(" ", strip=True)
+        candidates.append(h1_text)
+        # Wikipedia's JSON-LD "headline" is a description; its "name" is the
+        # real title — trust the <h1> when the two agree.
+        name = ld.get("name")
+        if isinstance(name, str) and name.strip().casefold() == h1_text.casefold():
+            candidates.insert(0, h1_text)
     if soup.title and soup.title.string:
         # Drop trailing " | SiteName" / " - SiteName" suffixes.
         candidates.append(re.split(r"\s+[|\-–—]\s+", soup.title.string)[0])
@@ -1528,7 +1555,19 @@ def soup_to_xhtml_body(html_fragment: str) -> str:
     frag = BeautifulSoup(html_fragment, PARSER)
     for bad in frag.find_all(["html", "body", "head"]):
         bad.unwrap()
-    return frag.decode()
+    # Framework/Word markup (`:class`, `@click`, `x-on:click`, `<o:p>`) uses
+    # names that are not legal (or undeclared-prefix) XML — drop/unwrap them.
+    for tag in frag.find_all(True):
+        if ":" in tag.name:
+            tag.unwrap()
+            continue
+        for attr in list(tag.attrs):
+            if not _XML_ATTR_NAME.match(attr):
+                del tag.attrs[attr]
+    return _XML_ILLEGAL.sub("", frag.decode())
+
+
+_XML_ATTR_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]*$")
 
 
 def write_epub(path: str, title: str, author: str, source_url: str,
@@ -1660,6 +1699,8 @@ def _is_truncated(candidate: "BeautifulSoup | None", ld: dict) -> bool:
     if candidate is None:
         return False
     word_count = ld.get("wordCount")
+    if isinstance(word_count, str) and word_count.strip().isdigit():
+        word_count = int(word_count)       # many sites ship it as a string
     if not isinstance(word_count, (int, float)) or word_count <= 0:
         return False
     got_words = len(candidate.get_text(" ", strip=True).split())
