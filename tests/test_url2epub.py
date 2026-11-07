@@ -68,6 +68,25 @@ def test_epub_well_formed_with_hostile_markup(tmp_path):
     assert "hi there" in body and "@click" not in body
 
 
+def _chapter_texts(path):
+    with zipfile.ZipFile(path) as z:
+        return ([z.read(n).decode() for n in sorted(z.namelist()) if n.startswith("EPUB/chap")],
+                z.read("EPUB/nav.xhtml").decode())
+
+
+def test_single_chapter_uses_book_title_not_article(tmp_path):
+    chaps, nav = _chapter_texts(build(tmp_path, "<div><h2>Real</h2><p>body text</p></div>", title="My Book"))
+    assert len(chaps) == 1 and ">Article<" not in chaps[0] and ">Article<" not in nav
+    assert "My Book" in nav and chaps[0].count("<h1>") == 0       # body already had a heading
+    chaps, _ = _chapter_texts(build(tmp_path, "<p>no heading here</p>", title="My Book"))
+    assert "<h1>My Book</h1>" in chaps[0]
+
+
+def test_mediawiki_edit_links_removed():
+    out = u.clean_soup(soup('<h2>Hist<span class="mw-editsection">[edit]</span></h2><p>x</p>'))
+    assert "[edit]" not in out.get_text()
+
+
 def test_chapters_split_on_headings():
     chs = u.split_into_chapters(soup("<p>intro</p><h1>A</h1><p>x</p><h2>B</h2><p>y</p>"))
     assert [t for t, _ in chs] == ["Introduction", "A", "B"]

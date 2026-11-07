@@ -145,6 +145,7 @@ JUNK_KEYWORDS = [
     "recommend", "sidebar", "popup", "modal", "overlay", "breadcrumb",
     "menu", "navigation", "pagination", "skip-link", "site-header",
     "site-footer", "widget", "masthead", "banner",
+    "mw-editsection",   # MediaWiki "[edit]" links next to every heading
 ]
 
 # Class/id hints used by the content SCORER (Section 6), not for deletion.
@@ -1587,10 +1588,18 @@ def write_epub(path: str, title: str, author: str, source_url: str,
               f"<p class='meta'>Generated on {today} by url2epub</p></div>"))
 
     # ---- Chapter files -----------------------------------------------------
+    # A one-chapter book is the article itself: label it with the book title
+    # (not "Article") and only add a heading when the body has none.
+    single = len(chapters) == 1
+    if single:
+        chapters = [(title, chapters[0][1])]
     chap_files = [] # (filename, xhtml_string, chapter_title)
     for i, (chap_title, chap_html) in enumerate(chapters, 1):
         body = soup_to_xhtml_body(chap_html)
-        if not body.lstrip().startswith(("<h1", "<h2")):
+        if single:
+            if BeautifulSoup(body, PARSER).find(["h1", "h2"]) is None:
+                body = f"<h1>{xml(chap_title)}</h1>" + body
+        elif not body.lstrip().startswith(("<h1", "<h2")):
             body = f"<h2>{xml(chap_title)}</h2>" + body
         chap_files.append((f"chap{i:02d}.xhtml",
                            XHTML_SHELL.format(title=xml(chap_title), body=body),
