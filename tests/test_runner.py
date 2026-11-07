@@ -81,7 +81,7 @@ def test_system_exit_message_is_cleaned(mod, out, monkeypatch):
     monkeypatch.setattr(mod, "resolve_article", fail)
     r = convert("https://e.com/a", out)
     assert not r.ok
-    assert r.error == "boom more"
+    assert r.error == "Boom more"
 
 
 def test_unexpected_exception_is_reported_not_raised(mod, out, monkeypatch):

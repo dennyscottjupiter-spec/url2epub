@@ -60,7 +60,8 @@ class LineWriter(io.TextIOBase):
 def _exit_text(code) -> str:
     if code in (None, 0):
         return "Stopped."
-    return " ".join(str(code).split()).removeprefix("ERROR: ")
+    text = " ".join(str(code).split()).removeprefix("ERROR: ")
+    return text[:1].upper() + text[1:]  # the engine's messages can start lowercase after the prefix
 
 
 def _run(mod, url, s: Settings, log, ask_full_page, t0: float) -> Result:
