@@ -1,16 +1,22 @@
 # ---
-# purpose: Main window: four tabs, status bar with folder/about buttons, and the worker-to-Tk queue
-# exports: App
-# depends: ui/*_view.py, ui/theme.py, ui/dialogs.py, core/runner.py, core/reports.py
+# purpose: Main window: sidebar shelf, stacked pages raised on demand, status line, worker-to-Tk queue
+# exports: App, PAGES
+# depends: ui/sidebar.py, ui/*_view.py, ui/theme.py, ui/dialogs.py, core/runner.py, core/reports.py
 # gotcha: Tk is not thread-safe; worker threads only call call_soon(), never widget methods
 # ---
 import queue
+import sys
 import threading
 import tkinter as tk
+from pathlib import Path
 from tkinter import ttk
 
 from core import connections, opener, paths, reports, runner, settings
-from ui import convert_view, dialogs, history_view, network_view, settings_view, theme
+from ui import (about_view, convert_view, dialogs, history_view, network_view, settings_view, theme)
+from ui.sidebar import Sidebar
+
+PAGES = (("convert", "Convert"), ("history", "History"), ("connections", "Connections"),
+         ("settings", "Settings"), ("about", "About"))
 
 
 class App(tk.Tk):
@@ -22,44 +28,75 @@ class App(tk.Tk):
         self._start = start
         self.settings = settings.load(self.settings_path)
         self.title("url2epub")
-        self.geometry("1000x660")
-        self.minsize(780, 540)
-        theme.apply(self, self.settings.theme)
+        # fit small laptop screens (1366x768 here) while leaving room for the taskbar
+        w, h = min(1100, self.winfo_screenwidth() - 60), min(720, self.winfo_screenheight() - 110)
+        self.geometry(f"{w}x{h}+{(self.winfo_screenwidth() - w) // 2}+{max(0, (self.winfo_screenheight() - h) // 2 - 30)}")
+        self.minsize(860, 560)
+        self._set_icon()
         self._queue = queue.Queue()
 
-        # status bar instead of a menu bar: Windows draws tk menu bars white, even in dark mode
-        bar = ttk.Frame(self, padding=(10, 0, 8, 6))
-        bar.pack(side="bottom", fill="x")
-        # buttons packed before the label so a long status text can't push them off-screen
-        self.about_btn = ttk.Button(bar, text="About", command=lambda: dialogs.about(self))
-        self.about_btn.pack(side="right")
-        self.folder_btn = ttk.Button(bar, text="Open output folder", command=self.open_output_folder)
-        self.folder_btn.pack(side="right", padx=(0, 6))
-        self.status_var = tk.StringVar(value=f"Books are saved to {self.settings.resolved_output_dir()}")
-        ttk.Label(bar, textvariable=self.status_var).pack(side="left", fill="x", expand=True)
-        self.notebook = ttk.Notebook(self, padding=8)
-        self.notebook.pack(fill="both", expand=True)
-        self.convert_view = convert_view.ConvertView(self.notebook, self)
-        self.history_view = history_view.HistoryView(self.notebook, self)
-        self.network_view = network_view.NetworkView(self.notebook, self, check_all=check_all)
-        self.settings_view = settings_view.SettingsView(self.notebook, self)
-        for view, label in ((self.convert_view, "Convert"), (self.history_view, "History"),
-                            (self.network_view, "Network"), (self.settings_view, "Settings")):
-            self.notebook.add(view, text=label)
+        self.sidebar = Sidebar(self, PAGES, self.show_page, self.open_output_folder)
+        self.sidebar.pack(side="left", fill="y")
+        self.folder_btn = self.sidebar.folder_btn
+        main = ttk.Frame(self)
+        main.pack(side="left", fill="both", expand=True)
 
-        self.convert_view.apply_colors(self.settings.theme)
+        status = ttk.Frame(main, padding=(36, 8, 36, 10))
+        status.pack(side="bottom", fill="x")
+        self.status_var = tk.StringVar(value=f"Books are saved to {self.settings.resolved_output_dir()}")
+        ttk.Label(status, textvariable=self.status_var, style="Status.TLabel").pack(side="left")
+        rule = tk.Frame(main, height=1)
+        rule.pack(side="bottom", fill="x", padx=36)
+        theme.listen(rule, lambda c: rule.configure(background=c["border"]))
+
+        stack = ttk.Frame(main, padding=(36, 28, 36, 14))
+        stack.pack(fill="both", expand=True)
+        stack.rowconfigure(0, weight=1)
+        stack.columnconfigure(0, weight=1)
+        self.convert_view = convert_view.ConvertView(stack, self)
+        self.history_view = history_view.HistoryView(stack, self)
+        self.network_view = network_view.NetworkView(stack, self, check_all=check_all)
+        self.settings_view = settings_view.SettingsView(stack, self)
+        self.about_view = about_view.AboutView(stack, self)
+        self.pages = dict(zip([k for k, _ in PAGES], (self.convert_view, self.history_view, self.network_view,
+                                                       self.settings_view, self.about_view)))
+        for view in self.pages.values():
+            view.grid(row=0, column=0, sticky="nsew")
+
+        for i, (key, _) in enumerate(PAGES, start=1):
+            self.bind_all(f"<Control-Key-{i}>", lambda e, k=key: self.show_page(k))
+        self.bind_all("<Control-l>", lambda e: self.focus_link())
+        theme.apply(self, self.settings.theme)
+        self.show_page("convert")
         self._pump_id = self.after(50, self._pump)
 
     def destroy(self):
         self.after_cancel(self._pump_id)
         super().destroy()
 
+    def _set_icon(self):
+        ico = paths.assets_dir() / "url2epub.ico"
+        if sys.platform == "win32" and ico.exists():
+            try:
+                self.iconbitmap(default=str(ico))
+            except tk.TclError:
+                pass
+
+    def show_page(self, key):
+        self.current_page = key
+        self.pages[key].tkraise()
+        self.sidebar.select(key)
+
+    def focus_link(self):
+        self.show_page("convert")
+        self.convert_view.url_entry.focus_set()
+        self.convert_view.url_entry.select_range(0, "end")
+
     def set_status(self, text):
         self.status_var.set(text)
 
     def set_theme(self, name):
         theme.apply(self, name)
-        self.convert_view.apply_colors(name)
 
     def open_output_folder(self):
         folder = self.settings.resolved_output_dir()
@@ -105,7 +142,8 @@ class App(tk.Tk):
         if not result.ok:
             self.set_status("Conversion failed")
             return
-        self.set_status(f"Saved {result.path}")
+        # file name only: a full path runs off the status line (the log keeps the full path)
+        self.set_status(f"Saved {Path(result.path).name}")
         if self.settings.open_folder_after:
             try:
                 opener.reveal(result.path)

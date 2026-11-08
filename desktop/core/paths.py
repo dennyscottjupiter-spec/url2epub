@@ -1,6 +1,6 @@
 # ---
 # purpose: App-data dirs, default output folder, engine location, collision-free output names
-# exports: APP_NAME, app_dir(), settings_file(), history_file(), default_output_dir(), engine_dir(), safe_stem(), unique_path()
+# exports: APP_NAME, app_dir(), settings_file(), history_file(), default_output_dir(), engine_dir(), assets_dir(), safe_stem(), unique_path()
 # gotcha: URL2EPUB_APPDIR overrides app_dir() entirely (tests isolate with it)
 # ---
 import os
@@ -43,6 +43,12 @@ def engine_dir() -> Path:
     if getattr(sys, "frozen", False):
         return Path(sys._MEIPASS)
     return Path(__file__).resolve().parents[2]
+
+
+def assets_dir() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(sys._MEIPASS) / "assets"
+    return Path(__file__).resolve().parents[1] / "assets"
 
 
 def safe_stem(stem: str) -> str:

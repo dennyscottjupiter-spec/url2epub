@@ -12,8 +12,9 @@ from tkinter import ttk
 import pytest
 
 from core import connections, opener, paths, reports, runner
-from ui import dialogs
-from ui.app import App
+from ui import VERSION, dialogs, palette, theme
+from ui.app import PAGES, App
+from ui.widgets import Button
 
 HINT = "Paste an article link and press Convert to EPUB. Progress shows here."
 MISSING = ("File not found", "That EPUB was moved or deleted.")
@@ -22,7 +23,7 @@ NO_SELECTION = ("Nothing selected", "Select a conversion in the list first.")
 def _fake_dialogs(monkeypatch, calls, tmp_path):
     answers = {"choose_folder": str(tmp_path / "books"),
                "save_as": lambda parent, name, ext, types: str(tmp_path / ("export" + ext))}
-    for name in ("ask_full_page", "error", "info", "confirm", "about", "choose_folder", "save_as"):
+    for name in ("ask_full_page", "error", "info", "confirm", "choose_folder", "save_as"):
         monkeypatch.setattr(dialogs, name, _spy(calls, name, answers.get(name, True)))
 
 def _spy(calls, name, answer):
@@ -174,9 +175,10 @@ def test_theme_reset_and_settings_folder(app):
     ui, calls = app
     sv = ui.settings_view
     sv.light_rb.invoke()
-    assert ttk.Style(ui).theme_use() == "sun-valley-light"
+    assert theme.current() == "light" and ttk.Style(ui).lookup("TFrame", "background") == palette.LIGHT["bg"]
+    assert ui.convert_view.log.cget("background") == palette.LIGHT["raised"]  # tk widgets follow too
     sv.dark_rb.invoke()
-    assert ttk.Style(ui).theme_use() == "sun-valley-dark"
+    assert theme.current() == "dark" and ttk.Style(ui).lookup("TFrame", "background") == palette.DARK["bg"]
     sv.timeout_var.set("50")
     sv.save_btn.invoke()
     sv.reset_btn.invoke()
@@ -186,14 +188,76 @@ def test_theme_reset_and_settings_folder(app):
     sv.appdata_btn.invoke()
     assert calls[-1] == ("open_path", str(paths.app_dir()))
 
-def test_status_bar_buttons_and_export_error(app, monkeypatch):
+def test_sidebar_folder_button_and_export_error(app, monkeypatch):
     ui, calls = app
     folder = ui.settings_path.parent / "books"
     ui.settings.output_dir = str(folder)
     ui.folder_btn.invoke()
-    ui.about_btn.invoke()
-    assert ("open_path", str(folder)) in calls and ("about", ()) in calls
+    assert ("open_path", str(folder)) in calls
     convert(ui, "https://example.com/a")
     monkeypatch.setattr(reports, "export_csv", lambda *a: (_ for _ in ()).throw(PermissionError("locked")))
     ui.history_view.export_csv_btn.invoke()
     assert ("error", ("Couldn't export", "locked")) in calls
+
+
+def test_sidebar_rows_and_shortcuts_switch_pages(app):
+    ui, _ = app
+    ui.deiconify()
+    ui.update()  # synthetic clicks and keys only reach a mapped window
+    for key, _label in PAGES:
+        ui.sidebar.rows[key]["text"].event_generate("<Button-1>")
+        assert ui.current_page == key and ui.sidebar.current == key
+    ui.convert_view.url_entry.focus_force()
+    ui.update()
+    for i, (key, _label) in enumerate(PAGES, start=1):
+        ui.event_generate(f"<Control-Key-{i}>")
+        ui.update()
+        assert ui.current_page == key
+    ui.event_generate("<Control-l>")
+    ui.update()
+    assert ui.current_page == "convert" and ui.focus_get() is ui.convert_view.url_entry
+
+
+def test_about_page_shows_version_and_changelog(app):
+    ui, _ = app
+    text = ui.about_view.log.get("1.0", "end")
+    assert f"Version {VERSION}" in text and "Version 1.0.0" in text
+    assert ui.about_view.log.cget("state") == "disabled"
+
+
+def test_keycap_button_api(app):
+    ui, _ = app
+    hits = []
+    btn = Button(ui, text="Go", command=lambda: hits.append(1))
+    btn.place(x=0, y=0)  # pack would leave it no room beside the expanding page frames
+    ui.deiconify()
+    ui.update()
+    btn.focus_force()
+    ui.update()
+    btn.event_generate("<KeyPress-space>")
+    ui.update()
+    ui.after(150)
+    ui.update()
+    assert hits == [1]
+    btn.state(["disabled"])
+    assert btn.instate(["disabled"]) and not btn.instate(["!disabled"])
+    btn.invoke()
+    assert hits == [1]
+    btn.state(["!disabled"])
+    btn.configure(text="Going")
+    assert btn.cget("text") == "Going" and btn.instate(["!disabled"])
+    btn.invoke()
+    assert hits == [1, 1]
+
+
+def test_cover_glint_runs_and_stops(app, monkeypatch):
+    ui, _ = app
+    monkeypatch.setattr(theme, "reduced_motion", lambda: False)
+    convert(ui, "https://example.com/a")
+    cover = ui.convert_view.cover
+    end = time.monotonic() + 3
+    while cover._glint is not None:
+        assert time.monotonic() < end
+        ui.update()
+        time.sleep(0.01)
+    assert not cover.canvas.find_withtag("glint")

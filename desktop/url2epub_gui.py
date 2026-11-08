@@ -15,6 +15,8 @@ def main():
     if sys.platform == "win32":
         try:
             ctypes.windll.shcore.SetProcessDpiAwareness(1)  # crisp text on scaled displays
+            # own taskbar identity, so the taskbar shows the url2epub icon instead of Python's
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("url2epub.desktop")
         except Exception:
             pass
     from ui.app import App

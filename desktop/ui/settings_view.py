@@ -1,13 +1,14 @@
 # ---
-# purpose: Settings tab: output folder, theme, timeouts, image and folder options, save/reset
+# purpose: Settings page in sections: saving (incl. X cookies note), appearance, fetching; save/reset
 # exports: SettingsView
-# depends: core/settings.py, core/paths.py, core/opener.py, ui/dialogs.py
+# depends: core/settings.py, core/paths.py, core/opener.py, ui/dialogs.py, ui/widgets.py
 # ---
 import tkinter as tk
 from tkinter import ttk
 
 from core import opener, paths, settings
 from ui import dialogs
+from ui.widgets import Button, header
 
 
 def _int(text, fallback):
@@ -19,7 +20,7 @@ def _int(text, fallback):
 
 class SettingsView(ttk.Frame):
     def __init__(self, parent, app):
-        super().__init__(parent, padding=12)
+        super().__init__(parent)
         self.app = app
         self.output_var = tk.StringVar()
         self.theme_var = tk.StringVar()
@@ -27,46 +28,79 @@ class SettingsView(ttk.Frame):
         self.image_var = tk.StringVar()
         self.embed_var = tk.BooleanVar()
         self.folder_var = tk.BooleanVar()
-        self.columnconfigure(1, weight=1)
+        header(self, "Settings", "Changes apply to the next conversion once you save them.")
 
-        ttk.Label(self, text="Save books to").grid(row=0, column=0, sticky="w", pady=4, padx=(0, 12))
-        ttk.Entry(self, textvariable=self.output_var).grid(row=0, column=1, sticky="ew")
-        self.browse_btn = ttk.Button(self, text="Browse…", command=self.browse)
-        self.browse_btn.grid(row=0, column=2, padx=(8, 0))
+        form = ttk.Frame(self)
+        form.pack(fill="x")
+        form.columnconfigure(1, weight=1)
+        self._row = 0
 
-        ttk.Label(self, text="Theme").grid(row=1, column=0, sticky="w", pady=4, padx=(0, 12))
-        themes = ttk.Frame(self)
-        themes.grid(row=1, column=1, sticky="w")
-        self.dark_rb = ttk.Radiobutton(themes, text="Dark", value="dark", variable=self.theme_var, command=self.pick_theme)
-        self.light_rb = ttk.Radiobutton(themes, text="Light", value="light", variable=self.theme_var, command=self.pick_theme)
-        self.dark_rb.pack(side="left", padx=(0, 16))
-        self.light_rb.pack(side="left")
-
-        ttk.Label(self, text="Page timeout (seconds)").grid(row=2, column=0, sticky="w", pady=4, padx=(0, 12))
-        ttk.Spinbox(self, from_=5, to=120, textvariable=self.timeout_var, width=8).grid(row=2, column=1, sticky="w")
-
-        ttk.Label(self, text="Largest image (MB)").grid(row=3, column=0, sticky="w", pady=4, padx=(0, 12))
-        ttk.Spinbox(self, from_=1, to=50, textvariable=self.image_var, width=8).grid(row=3, column=1, sticky="w")
-
-        self.embed_cb = ttk.Checkbutton(self, text="Include images", variable=self.embed_var)
-        self.embed_cb.grid(row=4, column=0, columnspan=3, sticky="w", pady=4)
-        self.folder_cb = ttk.Checkbutton(
-            self, text="Show the book in its folder when done", variable=self.folder_var,
-        )
-        self.folder_cb.grid(row=5, column=0, columnspan=3, sticky="w", pady=4)
-
+        self._section(form, "Saving")
+        self._label(form, "Save books to")
+        folder = ttk.Frame(form)
+        folder.grid(row=self._row, column=1, sticky="ew", pady=4)
+        ttk.Entry(folder, textvariable=self.output_var).pack(side="left", fill="x", expand=True, padx=(0, 8))
+        self.browse_btn = Button(folder, text="Browse…", command=self.browse)
+        self.browse_btn.pack(side="left")
+        self._next()
+        self.folder_cb = ttk.Checkbutton(form, text="Show the book in its folder when done", variable=self.folder_var)
+        self.folder_cb.grid(row=self._row, column=1, sticky="w", pady=2)
+        self._next()
         ttk.Label(
-            self, text="To read X (Twitter) Articles, save your x_cookies.txt in the output folder.",
-        ).grid(row=6, column=0, columnspan=3, sticky="w", pady=(16, 0))
+            form, style="Small.TLabel", wraplength=560, justify="left",
+            text="Some X (Twitter) Articles need a signed-in session. To convert those, put your x_cookies.txt "
+                 "in this folder.",
+        ).grid(row=self._row, column=1, sticky="w", pady=(2, 0))
+        self._next()
+
+        self._section(form, "Appearance")
+        self._label(form, "Theme")
+        themes = ttk.Frame(form)
+        themes.grid(row=self._row, column=1, sticky="w", pady=4)
+        self.dark_rb = ttk.Radiobutton(themes, text="Bookcloth (dark)", value="dark", variable=self.theme_var,
+                                       command=self.pick_theme, style="Segment.Toolbutton")
+        self.light_rb = ttk.Radiobutton(themes, text="E-ink paper (light)", value="light", variable=self.theme_var,
+                                        command=self.pick_theme, style="Segment.Toolbutton")
+        self.dark_rb.pack(side="left")
+        self.light_rb.pack(side="left")
+        self._next()
+
+        self._section(form, "Fetching")
+        self._label(form, "Page timeout")
+        self._spin(form, self.timeout_var, 5, 120, "seconds")
+        self._label(form, "Largest image")
+        self._spin(form, self.image_var, 1, 50, "MB")
+        self.embed_cb = ttk.Checkbutton(form, text="Include images in the book", variable=self.embed_var)
+        self.embed_cb.grid(row=self._row, column=1, sticky="w", pady=2)
+        self._next()
 
         buttons = ttk.Frame(self)
-        buttons.grid(row=7, column=0, columnspan=3, sticky="w", pady=(16, 0))
-        self.save_btn = ttk.Button(buttons, text="Save settings", style="Accent.TButton", command=self.save)
-        self.reset_btn = ttk.Button(buttons, text="Restore defaults", command=self.reset)
-        self.appdata_btn = ttk.Button(buttons, text="Open settings folder", command=self.open_appdata)
+        buttons.pack(fill="x", pady=(22, 0))
+        self.save_btn = Button(buttons, text="Save settings", command=self.save, variant="accent")
+        self.reset_btn = Button(buttons, text="Restore defaults", command=self.reset)
+        self.appdata_btn = Button(buttons, text="Open settings folder", command=self.open_appdata)
         for btn in (self.save_btn, self.reset_btn, self.appdata_btn):
-            btn.pack(side="left", padx=(0, 8))
+            btn.pack(side="left", padx=(0, 6))
         self.load_from(app.settings)
+
+    def _next(self):
+        self._row += 1
+
+    def _section(self, form, text):
+        pad = (0, 4) if self._row == 0 else (16, 4)
+        ttk.Label(form, text=text, style="Section.TLabel").grid(row=self._row, column=0, columnspan=2,
+                                                                sticky="w", pady=pad)
+        self._next()
+
+    def _label(self, form, text):
+        ttk.Label(form, text=text, style="Muted.TLabel").grid(row=self._row, column=0, sticky="w", padx=(0, 24))
+
+    def _spin(self, form, var, low, high, unit):
+        cell = ttk.Frame(form)
+        cell.grid(row=self._row, column=1, sticky="w", pady=4)
+        ttk.Spinbox(cell, from_=low, to=high, textvariable=var, width=6).pack(side="left")
+        ttk.Label(cell, text=unit, style="Muted.TLabel").pack(side="left", padx=(8, 0))
+        self._next()
 
     def pick_theme(self):
         self.app.set_theme(self.theme_var.get())

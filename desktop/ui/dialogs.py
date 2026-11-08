@@ -1,11 +1,8 @@
 # ---
 # purpose: Every messagebox and file dialog in the app, in one module the tests can replace
-# exports: ask_full_page(), error(), info(), confirm(), about(), choose_folder(), save_as()
-# depends: ui/__init__.py (VERSION)
+# exports: ask_full_page(), error(), info(), confirm(), choose_folder(), save_as()
 # ---
 from tkinter import filedialog, messagebox
-
-from ui import VERSION
 
 
 def ask_full_page(parent) -> bool:
@@ -27,15 +24,6 @@ def info(parent, title, message):
 
 def confirm(parent, title, message) -> bool:
     return messagebox.askyesno(title, message, parent=parent)
-
-
-def about(parent):
-    messagebox.showinfo(
-        "About url2epub",
-        f"url2epub {VERSION}\n\nTurns a web article into an EPUB for your e-reader.\n"
-        "Runs on your computer; nothing is uploaded.",
-        parent=parent,
-    )
 
 
 def choose_folder(parent, initial) -> str:
