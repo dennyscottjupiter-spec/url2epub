@@ -39,24 +39,28 @@ current folder. On Windows, use the desktop app below instead.
 
 ## 🖥️ Windows desktop app (`desktop/`)
 
-A separate tkinter app (dark Sun Valley theme) that drives the **same**
-`url2epub.py` engine — the Android script stays one untouched-by-desktop file.
+A separate tkinter app ("Bindery" design: midnight bookcloth + gilt, or e-ink
+paper) that drives the **same** `url2epub.py` engine — the Android script stays
+one untouched-by-desktop file. Pages switch instantly (Ctrl+1 … Ctrl+5).
 
-| Tab | What it does |
+| Page | What it does |
 | --- | --- |
-| **Convert** | Paste a link → **Convert to EPUB**. Live progress log; the finished book shows as a cover card with **Open EPUB** / **Show in folder**. |
-| **History** | Every conversion (OK or failed) — open, show in folder, copy link, export CSV / Markdown, clear. |
-| **Network** | Checks that the sites url2epub relies on (Wayback, archive.today, Jina, X) are reachable. |
+| **Convert** | Paste a link → **Convert to EPUB**. Live progress log; the finished book appears as a cloth-bound cover with **Open EPUB** / **Show in folder**. Ctrl+L jumps to the link field. |
+| **History** | Every conversion (saved or failed) — open, show in folder, copy link, export CSV / Markdown, clear. |
+| **Connections** | Checks that the sites url2epub relies on (Wayback, archive.today, Jina, X) are reachable. |
 | **Settings** | Output folder (default: your Downloads), dark/light theme, page timeout, largest image size, include images, show the book in its folder when done. |
+| **About** | What the app does, privacy, credits, and the full changelog. |
 
 - **Run from source:** `python3 desktop/url2epub_gui.py` (needs `requests`,
-  `beautifulsoup4`, `xclienttransaction`, `sv-ttk`).
+  `beautifulsoup4`, `xclienttransaction`; no theme package).
 - **Build the exe:** `powershell -NoProfile -File build_exe.ps1` (needs
   `pyinstaller`) → `dist\url2epub.exe`, one file, no Python needed to run it.
 - Settings and history live in `%APPDATA%\url2epub\`.
 - To read X Articles, put `x_cookies.txt` (see Troubleshooting) in the output folder.
 - **Tests:** `python3 -m pytest tests -q` — offline; covers the engine, the
-  desktop core and every UI button.
+  desktop core, every UI button, and a full conversion of a dummy test article.
+- Icon: built from Microsoft [Fluent Emoji](https://github.com/microsoft/fluentui-emoji)
+  (MIT): the blue book and the link.
 
 ---
 

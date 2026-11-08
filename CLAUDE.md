@@ -9,9 +9,10 @@ EPUB3. The engine stays one file (a hard product constraint). **It runs on Andro
 [PyDroid 3](https://play.google.com/store/apps/details?id=ru.iiec.pydroid3).** Running the script itself
 under desktop CPython is how it's developed/tested, but is *not* a supported use.
 
-**Windows desktop app (`desktop/`)** — a separate tkinter + sv-ttk GUI that *imports* the engine; it never
+**Windows desktop app (`desktop/`)** — a separate tkinter GUI that *imports* the engine; it never
 changes it. `desktop/core/` (paths, settings, engine loader, runner, connections, reports/history) and
-`desktop/ui/` (app + one file per tab, dialogs, cover card, theme); entry `desktop/url2epub_gui.py`.
+`desktop/ui/` (app shell + sidebar, one `*_view.py` per page, `widgets.Button`, cover, about + changelog,
+`palette` tokens, `theme`); entry `desktop/url2epub_gui.py`; icon in `desktop/assets/`.
 - `core/runner.convert()` is the only bridge: redirects the engine's `print`s to a log callback, turns its
   `sys.exit("ERROR: …")` into a `Result.error`, and answers its weak-extraction `input()` by temporarily
   setting a module-global `input` on the engine (a module global shadows the builtin). A lock serializes
@@ -19,13 +20,20 @@ changes it. `desktop/core/` (paths, settings, engine loader, runner, connections
 - `core/engine.apply_settings()` sets `TIMEOUT`, `MAX_IMAGE_BYTES`, `OUTPUT_DIR` (so `x_cookies.txt` is
   also found in the output folder). Settings/history: `%APPDATA%\url2epub\`.
 - UI rule: worker threads only `app.call_soon()`; every messagebox/filedialog goes through `ui/dialogs.py`
-  (tests monkeypatch it). Theme gotcha: never `update_idletasks()` inside `theme.apply` — it runs before
-  sv-ttk finishes and every frame turns light grey; the dark title bar (DWM) waits until the window is mapped.
+  (tests monkeypatch it).
+- **Theme = native ttk `clam` restyled from `ui/palette.py` tokens. Never bring back sv-ttk**: its
+  image-drawn widgets made every page switch take 1.8–3.5 s on this PC (clam: ~50 ms). Non-ttk widgets
+  (Text, Canvas, `widgets.Button`, sidebar) recolor through `theme.listen()`, called by `theme.apply()`.
+  clam gotchas: Progressbar height comes from `arrowsize` (below 6 the fill vanishes), not `thickness`.
+- `widgets.Button` is a Canvas "keycap" that mimics ttk.Button (`invoke/state/instate/cget/configure(text=)`).
+  Pages are stacked in one grid cell and `tkraise()`d; `requests` is imported lazily (~0.4 s of startup).
+- Changelog: add an entry at the top of `ui/changelog.py` and bump `ui/__init__.VERSION` together.
 - Exe: `powershell -NoProfile -File build_exe.ps1` → one-file windowed `dist\url2epub.exe`
-  (`url2epub-desktop.spec`: engine as hidden import, sv-ttk data, xclienttransaction submodules).
+  (`url2epub-desktop.spec`: engine as hidden import, `desktop/assets` data + icon, xclienttransaction).
 
 **Tests:** `python3 -m pytest tests -q` — fully offline: engine regressions (`test_url2epub.py`), each core
-module, and every UI button (`test_ui.py`, fake runner/dialogs/opener).
+module, every UI button (`test_ui.py`, fake runner/dialogs/opener), and `test_e2e_dummy.py`, which serves
+`tests/fixtures/dummy_article.html` on localhost and converts it with the REAL engine, then checks the EPUB.
 
 ## The overriding design constraint: zero compiled dependencies
 
@@ -217,3 +225,8 @@ becomes `None.get(...)` → `AttributeError: 'NoneType' object has no attribute 
 **Fix — SKIP already-decomposed nodes:** `if getattr(tag, "decomposed", False): continue` at the top of the
 loop (a no-op on older bs4). ⚠️ `tag.get("class") or []` does **NOT** fix it (it still dereferences the
 `None` `.attrs`). A crash on desktop may be this version skew, not the site.
+
+<!-- claude-reflect: learned rules (saved from the band; edit freely) -->
+## Learned rules
+- Before declaring any work done, run every available kind of test (smoke, pytest, real-user pass, etc.) and finalize only when all pass.
+<!-- end claude-reflect -->
