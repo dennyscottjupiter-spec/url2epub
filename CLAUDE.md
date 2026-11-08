@@ -4,10 +4,28 @@ Guidance for Claude Code (claude.ai/code) when working in this repository.
 
 ## What this is
 
-`url2epub.py` — one self-contained ~1,670-line script turning a web-article URL into a Kindle-friendly
-EPUB3. No package, build, dependency manifest, lint, CI, or tests; the whole program is one file (a hard
-product constraint). **It runs on Android only, inside [PyDroid 3](https://play.google.com/store/apps/details?id=ru.iiec.pydroid3).**
-Desktop CPython works and is how it's developed/tested, but is *not* a supported use.
+`url2epub.py` — one self-contained ~1,740-line script turning a web-article URL into a Kindle-friendly
+EPUB3. The engine stays one file (a hard product constraint). **It runs on Android only, inside
+[PyDroid 3](https://play.google.com/store/apps/details?id=ru.iiec.pydroid3).** Running the script itself
+under desktop CPython is how it's developed/tested, but is *not* a supported use.
+
+**Windows desktop app (`desktop/`)** — a separate tkinter + sv-ttk GUI that *imports* the engine; it never
+changes it. `desktop/core/` (paths, settings, engine loader, runner, connections, reports/history) and
+`desktop/ui/` (app + one file per tab, dialogs, cover card, theme); entry `desktop/url2epub_gui.py`.
+- `core/runner.convert()` is the only bridge: redirects the engine's `print`s to a log callback, turns its
+  `sys.exit("ERROR: …")` into a `Result.error`, and answers its weak-extraction `input()` by temporarily
+  setting a module-global `input` on the engine (a module global shadows the builtin). A lock serializes
+  runs because the engine keeps state in module globals.
+- `core/engine.apply_settings()` sets `TIMEOUT`, `MAX_IMAGE_BYTES`, `OUTPUT_DIR` (so `x_cookies.txt` is
+  also found in the output folder). Settings/history: `%APPDATA%\url2epub\`.
+- UI rule: worker threads only `app.call_soon()`; every messagebox/filedialog goes through `ui/dialogs.py`
+  (tests monkeypatch it). Theme gotcha: never `update_idletasks()` inside `theme.apply` — it runs before
+  sv-ttk finishes and every frame turns light grey; the dark title bar (DWM) waits until the window is mapped.
+- Exe: `powershell -NoProfile -File build_exe.ps1` → one-file windowed `dist\url2epub.exe`
+  (`url2epub-desktop.spec`: engine as hidden import, sv-ttk data, xclienttransaction submodules).
+
+**Tests:** `python3 -m pytest tests -q` — fully offline: engine regressions (`test_url2epub.py`), each core
+module, and every UI button (`test_ui.py`, fake runner/dialogs/opener).
 
 ## The overriding design constraint: zero compiled dependencies
 
@@ -169,18 +187,18 @@ To find a symbol, `Grep` its name — the table says which section owns it.
 | 0  | 28   | stdlib imports | — |
 | 1  | 43   | runtime auto-install of the 3 pure-Python deps | `ensure_packages`, `REQUIRED_PACKAGES` |
 | 2  | 96   | **all tuning knobs / config constants** | `OUTPUT_DIR`, `TIMEOUT`, `MAX_IMAGE_BYTES`, `MIN_GOOD_TEXT`, `HEADERS`, `_DESKTOP_HEADERS`, `JUNK_TAGS`, `JUNK_KEYWORDS`, `POSITIVE_HINTS`, `NEGATIVE_HINTS`, `EPUB_CSS` |
-| 3  | 179  | small pure helpers | `normalize_url`, `sanitize_filename`, `text_len`, `xml` |
-| 4  | 212  | fetch: retrying session, 403 UA retry, archive/Wayback/Jina recovery | `get_session`, `fetch_page`, `FetchError`, `_decode`, `fetch_via_archive`, `fetch_via_wayback`, `fetch_via_jina`, `ARCHIVE_HOSTS` |
-| 5  | 434  | metadata (title/author) incl. JSON-LD | `find_jsonld_article`, `detect_title`, `detect_author`, `iter_jsonld_objects` |
-| 6  | 510  | Reader-Mode extraction + JS-page fallbacks | `extract_main_content`, `score_container`, `link_density`, `jsonld_body_to_soup`, `find_amp_url`, `extract_from_noscript`, `extract_from_state`, `_looks_like_prose`, `extract_from_rss`, `find_rss_url` |
-| 6B | 769  | special-site: X / Twitter tweets (syndication JSON) | `tweet_to_article`, `fetch_tweet`, `_tweet_token`, `TWEET_URL_RE` |
-| 6C | 937  | special-site: X Articles (internal GraphQL, Draft.js, cookie auth) | `article_to_article`, `_article_once`, `_draftjs_to_html`, `_x_guest_client`, `_x_auth_client`, `_find_article_dict`, `_gql_get`, `ARTICLE_URL_RE`, `_GRAPHQL_REGISTRY`, `_LAST_ARTICLE_ERROR` |
-| 7  | 1373 | junk removal / soup cleanup | `clean_soup` |
-| 8  | 1418 | image download + EPUB embedding | `collect_images`, `pick_image_url`, `IMG_MIME` |
-| 9  | 1475 | chapter splitting on h1/h2 | `split_into_chapters`, `SPLIT_MARK` |
-| 10 | 1503 | hand-rolled EPUB3 writer (zip + templates) | `write_epub`, `soup_to_xhtml_body`, `XHTML_SHELL`, `CONTAINER_XML` |
-| 11 | 1628 | output-path resolution (Android Download → cwd) | `resolve_output_path` |
-| 12 | 1642 | orchestration: keep-best extraction, network escalation, X errors | `resolve_article`, `main`, `_candidate_quality`, `_is_truncated`, `_ARTICLE_ERROR_MESSAGES` |
+| 3  | 180  | small pure helpers | `normalize_url`, `sanitize_filename`, `text_len`, `xml` |
+| 4  | 218  | fetch: retrying session, 403 UA retry, archive/Wayback/Jina recovery | `get_session`, `fetch_page`, `FetchError`, `_decode`, `fetch_via_archive`, `fetch_via_wayback`, `fetch_via_jina`, `ARCHIVE_HOSTS` |
+| 5  | 456  | metadata (title/author) incl. JSON-LD | `find_jsonld_article`, `detect_title`, `detect_author`, `iter_jsonld_objects` |
+| 6  | 538  | Reader-Mode extraction + JS-page fallbacks | `extract_main_content`, `score_container`, `link_density`, `jsonld_body_to_soup`, `find_amp_url`, `extract_from_noscript`, `extract_from_state`, `_looks_like_prose`, `extract_from_rss`, `find_rss_url` |
+| 6B | 797  | special-site: X / Twitter tweets (syndication JSON) | `tweet_to_article`, `fetch_tweet`, `_tweet_token`, `TWEET_URL_RE` |
+| 6C | 965  | special-site: X Articles (internal GraphQL, Draft.js, cookie auth) | `article_to_article`, `_article_once`, `_draftjs_to_html`, `_x_guest_client`, `_x_auth_client`, `_find_article_dict`, `_gql_get`, `ARTICLE_URL_RE`, `_GRAPHQL_REGISTRY`, `_LAST_ARTICLE_ERROR` |
+| 7  | 1400 | junk removal / soup cleanup | `clean_soup` |
+| 8  | 1445 | image download + EPUB embedding | `collect_images`, `pick_image_url`, `IMG_MIME` |
+| 9  | 1502 | chapter splitting on h1/h2 | `split_into_chapters`, `SPLIT_MARK` |
+| 10 | 1530 | hand-rolled EPUB3 writer (zip + templates) | `write_epub`, `soup_to_xhtml_body`, `XHTML_SHELL`, `CONTAINER_XML` |
+| 11 | 1675 | output-path resolution (Android Download → cwd) | `resolve_output_path` |
+| 12 | 1689 | orchestration: keep-best extraction, network escalation, X errors | `resolve_article`, `main`, `_candidate_quality`, `_is_truncated`, `_ARTICLE_ERROR_MESSAGES` |
 
 ## Git workflow
 

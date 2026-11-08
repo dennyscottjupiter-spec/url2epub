@@ -2,6 +2,10 @@
 # The whole point of the tool is to spit out .epub files; never commit them.
 *.epub
 
+# --- PyInstaller output (build_exe.ps1) ---
+build/
+dist/
+
 # --- Python bytecode / caches ---
 __pycache__/
 *.py[cod]

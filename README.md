@@ -1,6 +1,13 @@
+---
+title: url2epub
+status: current
+updated: 2026-11-07
+---
+
 # 📖 url2epub
 
-**Turn any web article into a clean, Kindle-friendly EPUB — from your Android phone.**
+**Turn any web article into a clean, Kindle-friendly EPUB — from your Android phone,
+or from Windows with the desktop app.**
 
 `url2epub` is a single self-contained Python script that downloads a web
 article, strips away the ads / nav / cookie-banners / share-buttons, embeds the
@@ -19,14 +26,37 @@ Every design decision in this project exists **because the target is a phone**:
 | Decision | Why (Android/PyDroid 3 reason) |
 | --- | --- |
 | **Zero compiled dependencies** | PyDroid 3 has no C compiler; anything that builds from source (lxml, Pillow, ebooklib…) fails to `pip install` on the phone. |
-| **Only `requests` + `beautifulsoup4`** | Both are pure Python, so the runtime auto-install can never hit a compiler. |
+| **Only `requests` + `beautifulsoup4` (+ `xclienttransaction` for X Articles)** | All pure Python, so the runtime auto-install can never hit a compiler. |
 | **Hand-rolled EPUB writer + `html.parser`** | Avoids `ebooklib` and `lxml` entirely (both compiled). |
 | **Saves to `/storage/emulated/0/Download/`** | That's the phone's Downloads folder, where "Send to Kindle" and file managers can see it. |
 | **Samsung Galaxy S24 request fingerprint** | We identify as a real modern Android phone so sites serve normal mobile HTML. |
 
-It *technically* runs under desktop Python (that's how it's developed and
-tested), but that is **not a supported use** — on a desktop there's no
-`/storage/emulated/0/Download/`, so the file just lands in the current folder.
+Running `url2epub.py` itself under desktop Python is **not a supported use** —
+there's no `/storage/emulated/0/Download/`, so the file just lands in the
+current folder. On Windows, use the desktop app below instead.
+
+---
+
+## 🖥️ Windows desktop app (`desktop/`)
+
+A separate tkinter app (dark Sun Valley theme) that drives the **same**
+`url2epub.py` engine — the Android script stays one untouched-by-desktop file.
+
+| Tab | What it does |
+| --- | --- |
+| **Convert** | Paste a link → **Convert to EPUB**. Live progress log; the finished book shows as a cover card with **Open EPUB** / **Show in folder**. |
+| **History** | Every conversion (OK or failed) — open, show in folder, copy link, export CSV / Markdown, clear. |
+| **Network** | Checks that the sites url2epub relies on (Wayback, archive.today, Jina, X) are reachable. |
+| **Settings** | Output folder (default: your Downloads), dark/light theme, page timeout, largest image size, include images, show the book in its folder when done. |
+
+- **Run from source:** `python3 desktop/url2epub_gui.py` (needs `requests`,
+  `beautifulsoup4`, `xclienttransaction`, `sv-ttk`).
+- **Build the exe:** `powershell -NoProfile -File build_exe.ps1` (needs
+  `pyinstaller`) → `dist\url2epub.exe`, one file, no Python needed to run it.
+- Settings and history live in `%APPDATA%\url2epub\`.
+- To read X Articles, put `x_cookies.txt` (see Troubleshooting) in the output folder.
+- **Tests:** `python3 -m pytest tests -q` — offline; covers the engine, the
+  desktop core and every UI button.
 
 ---
 
@@ -44,8 +74,9 @@ tested), but that is **not a supported use** — on a desktop there's no
    the full article text in `<script type="application/ld+json">` for SEO;
    we mine it.
 ✅ **AMP mirrors** — if the normal page is thin, we try its `amphtml` version.
-✅ **Soft paywalls** 🗄️ — as a last resort we try a public **archive.today**
-   snapshot (best-effort; see limits below).
+✅ **Soft paywalls & blocked pages** 🗄️ — we try a public **archive.today**
+   snapshot, then the **Wayback Machine**, then **Jina Reader** (best-effort;
+   see limits below).
 
 ## 🚫 What it can't do (honest limits)
 
@@ -105,6 +136,7 @@ article split across sibling `<div>`s.
 | Saved to the script folder instead of Downloads | Grant PyDroid 3 the **Storage** permission and re-run. |
 | `HTTP 403 — access refused` | The site blocks bots or needs a login; url2epub will try archive.today, but some pages simply can't be fetched. |
 | An X link produces nothing | The post may be deleted, protected, or age-restricted (the API returns a "tombstone"). |
+| X **Article** fails | `x.com/i/article/…` needs a logged-in session: save `x_cookies.txt` (two lines, `auth_token=…` and `ct0=…`, from x.com devtools → Application → Cookies) next to the script or in the output folder. As of 2026-11 X's page change also breaks the `xclienttransaction` library this path relies on, until it ships an update. |
 | Extraction looks weak / wrong | Choose **1** at the prompt to embed the full cleaned page body instead. |
 
 ---
