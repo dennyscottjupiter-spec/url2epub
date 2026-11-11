@@ -1,7 +1,9 @@
 """Offline regression tests for url2epub.py (the Android single-file engine)."""
+import json
 import sys
 import zipfile
 import xml.etree.ElementTree as ET
+from html import escape
 from pathlib import Path
 
 import pytest
@@ -324,3 +326,44 @@ def test_article_retries_transient_then_gives_up(monkeypatch):
     calls = _scripted_article_once(monkeypatch, [u._ArticleTransient("x") for _ in range(3)])
     assert u.article_to_article(url) is None
     assert len(calls) == 3 and u._LAST_ARTICLE_ERROR == u._ARTICLE_ERROR_TRANSIENT_EXHAUSTED
+
+
+_RSS_JUNK = '<script>alert(1)</script><iframe src="x"></iframe>'
+_RSS_PROSE = "".join(f'<p onclick="x()" style="color:red">Real sentence of prose, number {n}.</p>'
+                     for n in range(30))
+
+
+def _patch_feed(monkeypatch, item_body):
+    feed = ("<rss><channel><item><link>https://e.com/post?utm=1&amp;x=2</link>"
+            + item_body + "</item></channel></rss>")
+    monkeypatch.setattr(u, "fetch_page", lambda *a, **k: (feed, "https://e.com/feed"))
+    return soup('<link rel="alternate" type="application/rss+xml" href="/feed">')
+
+
+def _extract_feed(page):
+    return u.extract_from_rss(page, "https://e.com/post", "https://e.com/post")
+
+
+def test_rss_escaped_body_is_decoded_and_cleaned(monkeypatch):
+    page = _patch_feed(monkeypatch, f"<description>{escape(_RSS_JUNK + _RSS_PROSE)}</description>")
+    out = _extract_feed(page)
+    assert out is not None and len(out.find_all("p")) == 30
+    assert "<p" not in out.get_text()
+    assert out.find("script") is None and out.find("iframe") is None
+    assert not any(t.has_attr("onclick") or t.has_attr("style") for t in out.find_all(True))
+
+
+def test_rss_cdata_body_still_works(monkeypatch):
+    page = _patch_feed(monkeypatch, f"<content:encoded><![CDATA[{_RSS_JUNK}{_RSS_PROSE}]]></content:encoded>")
+    out = _extract_feed(page)
+    assert len(out.find_all("p")) == 30 and out.find("script") is None
+
+
+def test_state_candidate_is_cleaned():
+    body = ("".join("<p onclick=x()>Sentence of real prose here, number %d. </p>" % i
+                    for i in range(30)) + "<iframe src=x></iframe>")
+    out = u.extract_from_state(soup("<script>window.__NEXT_DATA__ = "
+                                    + json.dumps({"body": body}) + ";</script>"))
+    assert u.text_len(out) > 500
+    assert out.find("iframe") is None
+    assert not any(t.has_attr("onclick") for t in out.find_all(True))

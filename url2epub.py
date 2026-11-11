@@ -36,7 +36,7 @@ import subprocess
 import sys
 import time
 import zipfile # EPUB = a zip file
-from html import escape
+from html import escape, unescape
 from urllib.parse import urljoin, urlparse
 
 # ----------------------------------------------------------------------------
@@ -721,7 +721,7 @@ def extract_from_state(full_soup: BeautifulSoup) -> "BeautifulSoup | None":
         return None
 
     parts = [s if "<" in s and ">" in s else f"<p>{xml(s)}</p>" for s in fragments]
-    return BeautifulSoup("".join(parts), PARSER)
+    return clean_soup(BeautifulSoup("".join(parts), PARSER))
 
 
 def find_rss_url(full_soup: BeautifulSoup, base_url: str) -> str:
@@ -745,7 +745,8 @@ def _rss_tag_text(block: str, tag: str) -> str:
         return ""
     inner = m.group(1).strip()
     cdata = re.search(r"<!\[CDATA\[(.*?)\]\]>", inner, re.S)
-    return (cdata.group(1) if cdata else inner).strip()
+    # Without CDATA the body is entity-escaped HTML (normal RSS/Atom form): decode it.
+    return (cdata.group(1) if cdata else unescape(inner)).strip()
 
 
 def _rss_same_url(a: str, b: str) -> bool:
@@ -789,7 +790,9 @@ def extract_from_rss(full_soup: BeautifulSoup, page_url: str,
                 or _rss_tag_text(block, "description"))
         if len(body) < MIN_GOOD_TEXT:
             return None
-        return BeautifulSoup(body, PARSER)
+        # Raw third-party HTML: clean it like the DOM path, which runs clean_soup too.
+        article = clean_soup(BeautifulSoup(body, PARSER))
+        return article if text_len(article) >= MIN_GOOD_TEXT else None
     return None
 
 
