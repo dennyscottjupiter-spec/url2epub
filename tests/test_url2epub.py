@@ -429,3 +429,8 @@ def test_gql_get_non_json_body_returns_none(monkeypatch):
         def generate_transaction_id(self, method, path):
             return "t"
     assert u._gql_get(S(), CT(), "Op", {}) is None
+
+
+def test_needs_login_message_names_output_folder():
+    msg = u._ARTICLE_ERROR_MESSAGES[u._ARTICLE_ERROR_NEEDS_LOGIN]
+    assert "output folder" in msg and "auth_token=<value>" in msg

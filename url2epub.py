@@ -1124,8 +1124,8 @@ def _x_auth_client() -> "tuple[requests.Session, ClientTransaction] | None":
         return None
     auth_token, ct0 = cookies.get("auth_token"), cookies.get("ct0")
     if not auth_token or not ct0:
-        print("[article] x_cookies.txt is missing auth_token or ct0 — "
-              "see CLAUDE.md for the expected format.")
+        print("[article] x_cookies.txt is missing auth_token or ct0 — it needs "
+              "two lines: auth_token=<value> and ct0=<value>.")
         return None
 
     s = requests.Session()
@@ -1335,8 +1335,8 @@ def _article_once(url: str, candidate_id: str, is_i_shape: bool) -> "dict | None
         if auth is None:
             _LAST_ARTICLE_ERROR = _ARTICLE_ERROR_NEEDS_LOGIN
             print("[article] this Article has no guest-readable API — a "
-                  "logged-in X session is required (see CLAUDE.md for "
-                  "x_cookies.txt setup).")
+                  "logged-in X session is required (x_cookies.txt — setup "
+                  "steps follow below).")
             return None
         s, ct = auth
         data = _gql_get(s, ct, "ArticleEntityResultByRestId",
@@ -1738,7 +1738,8 @@ _ARTICLE_ERROR_MESSAGES = {
         "       content to a logged-in session (guest access gets HTTP 404).\n"
         "       To read it: log into x.com in a browser, open devtools ->\n"
         "       Application -> Cookies, copy the 'auth_token' and 'ct0' values,\n"
-        "       and save them as x_cookies.txt next to url2epub.py:\n"
+        "       and save them as x_cookies.txt next to url2epub.py, or in the\n"
+        "       folder your books are saved to (Download / the output folder):\n"
         "           auth_token=<value>\n"
         "           ct0=<value>\n"
         "       Then run url2epub again."),
