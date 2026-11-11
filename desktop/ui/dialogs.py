@@ -1,8 +1,11 @@
 # ---
 # purpose: Every messagebox and file dialog in the app, in one module the tests can replace
-# exports: ask_full_page(), error(), info(), confirm(), choose_folder(), save_as()
+# exports: NO_READER, ask_full_page(), error(), info(), confirm(), choose_folder(), save_as()
 # ---
 from tkinter import filedialog, messagebox
+
+NO_READER = ("Windows could not open this file. There may be no app set up for EPUB files: "
+             "use Show in folder, or install an e-book reader such as Calibre.")
 
 
 def ask_full_page(parent) -> bool:

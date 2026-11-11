@@ -129,7 +129,10 @@ class HistoryView(ttk.Frame):
         if not path or not Path(path).exists():
             dialogs.error(self, "File not found", "That EPUB was moved or deleted.")
             return
-        action(path)
+        try:
+            action(path)
+        except OSError as e:  # no app registered for .epub (WinError 1155)
+            dialogs.error(self, "Couldn't open the book", f"{dialogs.NO_READER}\n\n{e}")
 
     def _export(self, ext, filetypes, writer):
         if not self.rows:

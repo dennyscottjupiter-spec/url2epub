@@ -261,3 +261,21 @@ def test_cover_glint_runs_and_stops(app, monkeypatch):
         ui.update()
         time.sleep(0.01)
     assert not cover.canvas.find_withtag("glint")
+
+
+def test_open_failure_is_reported(app, monkeypatch):
+    ui, calls = app
+    convert(ui, "https://example.com/a")
+
+    def boom(path):  # what Windows raises when no app is registered for .epub (WinError 1155)
+        raise OSError(1155, "No application is associated")
+
+    monkeypatch.setattr(opener, "open_path", boom)
+    monkeypatch.setattr(opener, "reveal", boom)
+    ui.convert_view.cover.open_btn.invoke()
+    ui.history_view.tree.selection_set("0")
+    ui.history_view.open_btn.invoke()
+    ui.history_view.reveal_btn.invoke()
+    ui.settings.output_dir = str(ui.settings_path.parent / "books")  # keep the real output folder untouched
+    ui.folder_btn.invoke()
+    assert [args[0] for name, args in calls if name == "error"] == ["Couldn't open the book"] * 3 + ["Couldn't open the folder"]

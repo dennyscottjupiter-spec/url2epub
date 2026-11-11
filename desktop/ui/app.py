@@ -100,8 +100,11 @@ class App(tk.Tk):
 
     def open_output_folder(self):
         folder = self.settings.resolved_output_dir()
-        folder.mkdir(parents=True, exist_ok=True)
-        opener.open_path(folder)
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+            opener.open_path(folder)
+        except OSError as e:  # e.g. the saved output folder is on a missing drive
+            dialogs.error(self, "Couldn't open the folder", str(e))
 
     def call_soon(self, fn, *args):
         self._queue.put((fn, args))

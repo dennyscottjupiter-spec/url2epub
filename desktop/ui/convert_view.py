@@ -123,6 +123,8 @@ class ConvertView(ttk.Frame):
             action(self.cover.result.path)
         except FileNotFoundError:
             dialogs.error(self, "File not found", "That EPUB was moved or deleted.")
+        except OSError as e:  # no app registered for .epub (WinError 1155)
+            dialogs.error(self, "Couldn't open the book", f"{dialogs.NO_READER}\n\n{e}")
 
     def _set_busy(self, busy):
         self.busy = busy
