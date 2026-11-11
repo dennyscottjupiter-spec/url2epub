@@ -240,3 +240,87 @@ def test_draftjs_rendering():
 def test_pick_image_url_lazy_attrs():
     assert u.pick_image_url(soup('<img data-src="a.png" src="data:x">').img) == "a.png"
     assert u.pick_image_url(soup('<img srcset="s.png 1x, l.png 2x">').img) == "l.png"
+
+
+def test_tweet_to_article_renders_text_media_and_quote(monkeypatch):
+    tweet = {
+        "text": "Hello world https://t.co/abc https://t.co/img",
+        "entities": {"urls": [{"url": "https://t.co/abc", "display_url": "example.com/x"}]},
+        "user": {"name": "Ann", "screen_name": "ann"},
+        "created_at": "2012-11-07T10:00:00.000Z",
+        "mediaDetails": [
+            {"media_url_https": "https://pbs.twimg.com/a.jpg", "type": "photo"},
+            {"media_url_https": "https://pbs.twimg.com/v.jpg", "type": "video"},
+        ],
+        "quoted_tweet": {"text": "Quoted text", "user": {"name": "Bob", "screen_name": "bob"}},
+    }
+    monkeypatch.setattr(u, "fetch_tweet", lambda tid: tweet)
+    out = u.tweet_to_article("https://x.com/ann/status/20")
+    body = out["article"].get_text()
+    assert out["author"] == "Ann (@ann)"
+    assert out["title"].startswith("Ann on X - Hello world example.com/x")
+    for s in ("example.com/x", "Quoted text", "Quoting Bob (@bob)", "07 November 2012", "poster frame"):
+        assert s in body
+    assert "t.co" not in body
+    assert len(out["article"].find_all("img")) == 2
+    assert u.tweet_to_article("https://example.com/a") is None
+
+
+class _Img:
+    def __init__(self, content, ctype="image/png", fail=False):
+        self.content, self.headers, self._fail = content, {"Content-Type": ctype}, fail
+
+    def raise_for_status(self):
+        if self._fail:
+            raise u.requests.exceptions.HTTPError("404")
+
+
+def test_collect_images_embeds_dedupes_and_drops(monkeypatch):
+    routes = {
+        "https://e.com/a.png": _Img(b"PNGAA"),
+        "https://e.com/pic?id=1": _Img(b"WEBPX", ctype="image/webp"),
+        "https://e.com/b.jpg": _Img(b"", fail=True),
+        "https://e.com/big.png": _Img(b"x" * 11),
+    }
+    fetched = []
+
+    class S:
+        def get(self, url, timeout=None):
+            fetched.append(url)
+            return routes[url]
+
+    monkeypatch.setattr(u, "get_session", lambda: S())
+    monkeypatch.setattr(u, "MAX_IMAGE_BYTES", 10)
+    doc = soup('<div><img src="/a.png" alt="x"><img src="/a.png"><img src="/pic?id=1">'
+               '<img src="/b.jpg"><img src="/big.png"><img></div>')
+    got = u.collect_images(doc, "https://e.com/page")
+    assert got == [("images/img001.png", "image/png", b"PNGAA"),
+                   ("images/img002.webp", "image/webp", b"WEBPX")]
+    assert [i["src"] for i in doc.find_all("img")] == [
+        "images/img001.png", "images/img001.png", "images/img002.webp"]
+    assert fetched.count("https://e.com/a.png") == 1
+
+
+def _scripted_article_once(monkeypatch, outcomes):
+    calls, it = [], iter(outcomes)
+
+    def once(*a):
+        calls.append(a)
+        out = next(it)
+        if isinstance(out, Exception):
+            raise out
+        return out
+    monkeypatch.setattr(u, "_article_once", once)
+    return calls
+
+
+def test_article_retries_transient_then_gives_up(monkeypatch):
+    monkeypatch.setattr(u.time, "sleep", lambda s: None)
+    url = "https://x.com/w/article/1"
+    calls = _scripted_article_once(monkeypatch, [
+        u._ArticleTransient("x"), u._ArticleTransient("x"), {"title": "T"}])
+    assert u.article_to_article(url) == {"title": "T"}
+    assert len(calls) == 3
+    calls = _scripted_article_once(monkeypatch, [u._ArticleTransient("x") for _ in range(3)])
+    assert u.article_to_article(url) is None
+    assert len(calls) == 3 and u._LAST_ARTICLE_ERROR == u._ARTICLE_ERROR_TRANSIENT_EXHAUSTED
