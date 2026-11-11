@@ -1772,6 +1772,18 @@ _ARTICLE_ERROR_MESSAGES = {
 }
 
 
+def _is_weak(candidate: "BeautifulSoup | None") -> bool:
+    return candidate is None or text_len(candidate) < MIN_GOOD_TEXT
+
+
+def _improves(new: "BeautifulSoup | None", current: "BeautifulSoup | None") -> bool:
+    """A usable network copy replaces the current article only if it is longer:
+       a shorter archive snapshot must never swap out a longer truncated teaser."""
+    if _is_weak(new):
+        return False
+    return _is_weak(current) or text_len(new) > text_len(current)
+
+
 def resolve_article(url: str) -> "tuple[str, str, BeautifulSoup, str]":
     """Turn a URL into (title, author, article_soup, base_url_for_images).
        Special-site handlers (X/Twitter, X Articles) first, else the generic
@@ -1877,15 +1889,14 @@ def resolve_article(url: str) -> "tuple[str, str, BeautifulSoup, str]":
         print(f"[extract] best local candidate: {best_label} "
               f"({text_len(article):,} chars).")
 
-    if article is None or text_len(article) < MIN_GOOD_TEXT:
+    if _is_weak(article) or _is_truncated(article, ld):
         amp = find_amp_url(full_soup, final_url)
         if amp and amp != final_url:
             print(f"[extract] trying AMP version: {amp}")
             try:
                 amp_html, _ = fetch_page(amp, quiet=True)
                 amp_article = extract_main_content(BeautifulSoup(amp_html, PARSER))
-                if amp_article is not None and \
-                        text_len(amp_article) >= MIN_GOOD_TEXT:
+                if _improves(amp_article, article):
                     article = amp_article
                     final_url = amp  # images now resolve against AMP
                     print("[extract] AMP version extracted successfully.")
@@ -1893,14 +1904,15 @@ def resolve_article(url: str) -> "tuple[str, str, BeautifulSoup, str]":
                 pass  # AMP fetch failed → keep going
 
     # Skip if already loaded from a snapshot at fetch time.
-    if (article is None or text_len(article) < MIN_GOOD_TEXT) and not used_archive:
-        print("[extract] still weak — trying archive.today snapshot ...")
+    if (_is_weak(article) or _is_truncated(article, ld)) and not used_archive:
+        print(f"[extract] {'still weak' if _is_weak(article) else 'looks cut off'} "
+              "— trying archive.today snapshot ...")
         snap = fetch_via_archive(url)
         if snap is not None:
             snap_html, snap_url = snap
             snap_soup = BeautifulSoup(snap_html, PARSER)
             snap_article = extract_main_content(snap_soup)
-            if snap_article is not None and text_len(snap_article) >= MIN_GOOD_TEXT:
+            if _improves(snap_article, article):
                 article = snap_article
                 final_url = snap_url            # images resolve against snapshot
                 snap_ld = find_jsonld_article(snap_soup)
@@ -1910,14 +1922,15 @@ def resolve_article(url: str) -> "tuple[str, str, BeautifulSoup, str]":
                     author = detect_author(snap_soup, snap_ld)
                 print("[extract] recovered article from archive.today.")
 
-    if article is None or text_len(article) < MIN_GOOD_TEXT:
-        print("[extract] still weak — trying the Wayback Machine ...")
+    if _is_weak(article) or _is_truncated(article, ld):
+        print(f"[extract] {'still weak' if _is_weak(article) else 'looks cut off'} "
+              "— trying the Wayback Machine ...")
         wb = fetch_via_wayback(url)
         if wb is not None:
             wb_html, wb_url = wb
             wb_soup = BeautifulSoup(wb_html, PARSER)
             wb_article = extract_main_content(wb_soup)
-            if wb_article is not None and text_len(wb_article) >= MIN_GOOD_TEXT:
+            if _improves(wb_article, article):
                 article = wb_article
                 final_url = wb_url          # images resolve against the snapshot
                 wb_ld = find_jsonld_article(wb_soup)
@@ -1927,7 +1940,7 @@ def resolve_article(url: str) -> "tuple[str, str, BeautifulSoup, str]":
                     author = detect_author(wb_soup, wb_ld)
                 print("[extract] recovered article from the Wayback Machine.")
 
-    if article is None or text_len(article) < MIN_GOOD_TEXT:
+    if _is_weak(article):
         print("[extract] still weak — trying Jina Reader ...")
         jina = fetch_via_jina(url)
         if jina is not None:
@@ -1938,7 +1951,7 @@ def resolve_article(url: str) -> "tuple[str, str, BeautifulSoup, str]":
                 title = jina_title
             print("[extract] recovered article via Jina Reader.")
 
-    if article is None or text_len(article) < MIN_GOOD_TEXT:
+    if _is_weak(article):
         print("\n[!] Extraction looks WEAK (very little text found).")
         print("    Possible causes: JavaScript-only site, paywall, odd layout.")
         print("\n 1) Use the FULL cleaned page body instead (may include clutter)")
@@ -1952,6 +1965,11 @@ def resolve_article(url: str) -> "tuple[str, str, BeautifulSoup, str]":
         else:
             sys.exit("Aborted by user.")
 
+    if not _is_weak(article) and _is_truncated(article, ld):
+        got = len(article.get_text(" ", strip=True).split())
+        wc = int(ld["wordCount"])
+        print(f"[warn] the page says it has about {wc:,} words but only {got:,} "
+              "were found — this book may be cut off (paywall or 'continue reading').")
     print(f"[extract] clean article text: {text_len(article):,} characters.")
     return title, author, article, final_url
 

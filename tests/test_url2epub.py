@@ -458,3 +458,69 @@ def test_formatted_candidate_beats_plain_copy():
     plain_long = u.jsonld_body_to_soup({"articleBody": (para + "\n") * 80})
     assert u._candidate_quality(plain_long) > u._candidate_quality(rich)
     assert u._candidate_quality(None) == 0.0
+
+
+P = "<p>This is a long, real, paragraph of prose text.</p>"
+TEASER = ('<html><head><script type="application/ld+json">'
+          '{"@type":"Article","headline":"H","wordCount":"5000"}</script></head>'
+          '<body><article>' + P * 30 + '</article></body></html>')
+NO_COUNT = TEASER.replace(',"wordCount":"5000"', '')
+FULL = "<html><body><article>" + P * 600 + "</article></body></html>"
+
+
+def _no_prompt(*_a):
+    raise AssertionError("must not prompt")
+
+
+def _must_not_call(*_a, **_k):
+    raise AssertionError("must not be called")
+
+
+def _offline(monkeypatch, page=TEASER):
+    monkeypatch.setattr(u, "fetch_page", lambda url, quiet=False: (page, url))
+    monkeypatch.setattr(u, "input", _no_prompt, raising=False)
+
+
+def test_truncated_article_is_recovered_from_archive(monkeypatch):
+    _offline(monkeypatch)
+    monkeypatch.setattr(u, "fetch_via_archive", lambda url: (FULL, "https://archive.ph/x"))
+    monkeypatch.setattr(u, "fetch_via_wayback", _must_not_call)
+    monkeypatch.setattr(u, "fetch_via_jina", _must_not_call)
+    title, _, article, base = u.resolve_article("https://e.com/x")
+    assert u.text_len(article) > 20000
+    assert title == "H" and base == "https://archive.ph/x"
+
+
+def test_truncated_article_without_snapshot_warns(monkeypatch, capsys):
+    _offline(monkeypatch)
+    calls = []
+    monkeypatch.setattr(u, "fetch_via_archive", lambda url: calls.append("archive"))
+    monkeypatch.setattr(u, "fetch_via_wayback", lambda url: calls.append("wayback"))
+    monkeypatch.setattr(u, "fetch_via_jina", _must_not_call)
+    _, _, article, base = u.resolve_article("https://e.com/x")
+    assert calls == ["archive", "wayback"]
+    assert 1000 < u.text_len(article) < 2000
+    assert base == "https://e.com/x"
+    out = capsys.readouterr().out
+    assert "[warn]" in out and "cut off" in out
+
+
+def test_complete_article_makes_no_archive_calls(monkeypatch):
+    _offline(monkeypatch, page=NO_COUNT)
+    monkeypatch.setattr(u, "fetch_via_archive", _must_not_call)
+    monkeypatch.setattr(u, "fetch_via_wayback", _must_not_call)
+    monkeypatch.setattr(u, "fetch_via_jina", _must_not_call)
+    _, _, article, base = u.resolve_article("https://e.com/x")
+    assert 1000 < u.text_len(article) < 2000
+    assert base == "https://e.com/x"
+
+
+def test_shorter_snapshot_does_not_replace(monkeypatch):
+    _offline(monkeypatch)
+    short = "<html><body><article>" + P * 12 + "</article></body></html>"
+    monkeypatch.setattr(u, "fetch_via_archive", lambda url: (short, "https://archive.ph/x"))
+    monkeypatch.setattr(u, "fetch_via_wayback", lambda url: None)
+    monkeypatch.setattr(u, "fetch_via_jina", _must_not_call)
+    _, _, article, base = u.resolve_article("https://e.com/x")
+    assert 1000 < u.text_len(article) < 2000
+    assert base == "https://e.com/x"
