@@ -1712,16 +1712,24 @@ def resolve_output_path(filename: str) -> str:
 # ----------------------------------------------------------------------------
 # SECTION 12 — Main program flow
 # ----------------------------------------------------------------------------
+_RICH_TAGS = ["img", "figure", "h1", "h2", "h3", "h4", "a", "ul", "ol", "blockquote", "pre", "table"]
+
+
 def _candidate_quality(candidate: "BeautifulSoup | None") -> float:
     """One-line quality heuristic used to keep the BEST local extraction
        candidate instead of the first one that merely clears MIN_GOOD_TEXT —
        stops a short, link-heavy nav block from beating real article prose,
        the only failure mode raw character count has. Deliberately not a
        multi-signal scorer: both text_len and link_density already exist and
-       are already used by score_container, so this adds no new machinery."""
+       are already used by score_container, so this adds no new machinery.
+       A candidate with no structural tags at all (images, headings, links, lists)
+       gets a x0.8 penalty, so a plain-text copy of the same words must be about 1.25x longer to win."""
     if candidate is None:
         return 0.0
-    return text_len(candidate) * (1.0 - link_density(candidate))
+    quality = text_len(candidate) * (1.0 - link_density(candidate))
+    if candidate.find(_RICH_TAGS) is None:
+        quality *= 0.8
+    return quality
 
 
 def _is_truncated(candidate: "BeautifulSoup | None", ld: dict) -> bool:

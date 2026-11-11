@@ -448,3 +448,13 @@ def test_links_are_made_absolute():
     assert 'href="mailto:a@b.c"' in out
     assert "javascript:" not in out and ">J<" in out
     assert 'href="/a"' in u.soup_to_xhtml_body('<a href="/a">A</a>')
+
+
+def test_formatted_candidate_beats_plain_copy():
+    para = "This is a long, real, paragraph of prose text with one link in it."
+    rich = soup("<h2>Part</h2>" + ("<p>" + para.replace("one link", "<a href='/x'>one link</a>") + "</p>") * 40)
+    plain = u.jsonld_body_to_soup({"articleBody": (para + "\n") * 40})
+    assert u._candidate_quality(rich) > u._candidate_quality(plain)
+    plain_long = u.jsonld_body_to_soup({"articleBody": (para + "\n") * 80})
+    assert u._candidate_quality(plain_long) > u._candidate_quality(rich)
+    assert u._candidate_quality(None) == 0.0
