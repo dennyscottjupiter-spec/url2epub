@@ -367,3 +367,65 @@ def test_state_candidate_is_cleaned():
     assert u.text_len(out) > 500
     assert out.find("iframe") is None
     assert not any(t.has_attr("onclick") for t in out.find_all(True))
+
+
+def _fake_registry(monkeypatch, *outcomes):
+    calls, it = [], iter(outcomes)
+
+    class Resp:
+        def __init__(self, body):
+            self._body = body
+
+        def json(self):
+            return self._body
+
+    class S:
+        def get(self, *a, **k):
+            calls.append(a)
+            out = next(it)
+            if isinstance(out, Exception):
+                raise out
+            return Resp(out)
+    monkeypatch.setattr(u, "get_session", lambda: S())
+    return calls
+
+
+def test_gql_registry_failure_is_not_cached(monkeypatch):
+    monkeypatch.setattr(u, "_gql_registry_cache", None)
+    registry = [{"exports": {"operationName": "Op", "queryId": "Q1",
+                             "metadata": {"featureSwitch": {"f": {"value": "true"}}}}}]
+    calls = _fake_registry(monkeypatch, u.requests.exceptions.ConnectionError("down"), registry)
+    assert u._gql_operation("Op") is None
+    assert u._gql_operation("Op") == ("Q1", {"f": True})
+    assert u._gql_operation("Op") == ("Q1", {"f": True})
+    assert len(calls) == 2
+
+
+def test_gql_registry_bad_shapes_return_none(monkeypatch):
+    monkeypatch.setattr(u, "_gql_registry_cache", None)
+    junk = [{"exports": {"operationName": "Op"}}, "junk", {"exports": None}]
+    _fake_registry(monkeypatch, {"message": "rate limited"}, junk)
+    assert u._gql_operation("Op") is None
+    assert u._gql_operation("Op") is None
+
+
+def test_gql_get_non_json_body_returns_none(monkeypatch):
+    monkeypatch.setattr(u, "_gql_operation", lambda name: ("Q1", {}))
+
+    class Resp:
+        ok = True
+        status_code = 200
+
+        def json(self):
+            raise ValueError("not json")
+
+    class S:
+        headers = {}
+
+        def get(self, *a, **k):
+            return Resp()
+
+    class CT:
+        def generate_transaction_id(self, method, path):
+            return "t"
+    assert u._gql_get(S(), CT(), "Op", {}) is None

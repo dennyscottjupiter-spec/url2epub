@@ -1033,16 +1033,25 @@ def _gql_operation(op_name: str) -> "tuple[str, dict] | None":
     global _gql_registry_cache
     if _gql_registry_cache is None:
         try:
-            _gql_registry_cache = get_session().get(
+            registry = get_session().get(
                 _GRAPHQL_REGISTRY, timeout=TIMEOUT).json()
-        except Exception:
-            _gql_registry_cache = []
+        except Exception as exc:
+            print(f"[article] could not load the doc_id registry: {exc}")
+            return None   # not cached, so the next call retries the download
+        if not isinstance(registry, list):
+            print("[article] the doc_id registry has an unexpected shape.")
+            return None
+        _gql_registry_cache = registry
     for entry in _gql_registry_cache:
-        exp = entry.get("exports", {})
-        if exp.get("operationName") == op_name:
+        exp = entry.get("exports") if isinstance(entry, dict) else None
+        if not isinstance(exp, dict) or exp.get("operationName") != op_name:
+            continue
+        try:
             features = {k: v["value"] == "true"
                         for k, v in exp["metadata"]["featureSwitch"].items()}
             return exp["queryId"], features
+        except (KeyError, TypeError, AttributeError):
+            return None
     return None
 
 
@@ -1174,8 +1183,8 @@ def _gql_get(s: requests.Session, ct: ClientTransaction, op_name: str,
     """One signed GraphQL GET: fresh transaction-id + live doc_id per call."""
     op = _gql_operation(op_name)
     if op is None:
-        print(f"[article] '{op_name}' is missing from the live doc_id "
-              f"registry — X's API may have changed.")
+        print(f"[article] no doc_id for '{op_name}' (registry unreachable, "
+              f"or X renamed the operation).")
         return None
     doc_id, features = op
     params = {"variables": json.dumps(variables), "features": json.dumps(features)}
@@ -1192,7 +1201,12 @@ def _gql_get(s: requests.Session, ct: ClientTransaction, op_name: str,
     if not r.ok:
         print(f"[article] {op_name} request failed: HTTP {r.status_code}")
         return None
-    return r.json()
+    try:
+        data = r.json()
+    except ValueError:
+        print(f"[article] {op_name} returned a non-JSON body.")
+        return None
+    return data if isinstance(data, dict) else None
 
 
 _DRAFTJS_BLOCK_TAGS = {
@@ -1305,7 +1319,7 @@ def _article_once(url: str, candidate_id: str, is_i_shape: bool) -> "dict | None
         }, field_toggles=_ARTICLE_FIELD_TOGGLES)
         if data is None:
             raise _ArticleTransient("GraphQL request failed (HTTP error or rate limit)")
-        tweet = (data.get("data") or {}).get("tweetResult", {}).get("result", {}) or {}
+        tweet = ((data.get("data") or {}).get("tweetResult") or {}).get("result") or {}
         if not tweet and data.get("errors"):
             # No result at all + an errors array => usually a rate-limit/auth
             # blip, not a genuinely article-less tweet. Worth another attempt.
