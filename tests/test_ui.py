@@ -279,3 +279,28 @@ def test_open_failure_is_reported(app, monkeypatch):
     ui.settings.output_dir = str(ui.settings_path.parent / "books")  # keep the real output folder untouched
     ui.folder_btn.invoke()
     assert [args[0] for name, args in calls if name == "error"] == ["Couldn't open the book"] * 3 + ["Couldn't open the folder"]
+
+
+def test_history_write_failure_does_not_block_convert(app, monkeypatch):
+    ui, _ = app
+
+    def locked(*args):
+        raise PermissionError("locked")
+
+    monkeypatch.setattr(reports, "append", locked)
+    convert(ui, "https://example.com/a")
+    cv = ui.convert_view
+    assert cv.cover.result.title == "A Book"
+    assert "could not update the history" in cv.log.get("1.0", "end")
+    assert cv.convert_btn.instate(["!disabled"])
+
+
+def test_full_page_dialog_error_does_not_hang(app, monkeypatch):
+    ui, _ = app
+
+    def broken(parent):
+        raise RuntimeError("tk")
+
+    monkeypatch.setattr(dialogs, "ask_full_page", broken)
+    convert(ui, "https://example.com/a")
+    assert ui.convert_view.cover.result is not None

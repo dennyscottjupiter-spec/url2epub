@@ -52,11 +52,13 @@ def clear(path=None) -> None:
 
 def summary(rows: list[dict]) -> dict:
     ok_rows = [r for r in rows if r.get("ok")]
+    # a hand-edited history row can hold a string or null size; those count as 0
+    sizes = [r.get("size_kb") for r in ok_rows]
     return {
         "total": len(rows),
         "ok": len(ok_rows),
         "failed": len(rows) - len(ok_rows),
-        "total_kb": sum(r.get("size_kb", 0) for r in ok_rows),
+        "total_kb": sum(s for s in sizes if isinstance(s, int) and not isinstance(s, bool)),
     }
 
 

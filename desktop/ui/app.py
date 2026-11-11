@@ -131,16 +131,23 @@ class App(tk.Tk):
         answer = {}
 
         def ask():
-            answer["value"] = dialogs.ask_full_page(self)
-            done.set()
+            try:
+                answer["value"] = dialogs.ask_full_page(self)
+            except Exception:  # a dialog error must not leave the worker waiting forever
+                answer["value"] = False
+            finally:
+                done.set()
 
         self.call_soon(ask)
         done.wait()
         return answer.get("value", False)
 
     def _job_done(self, result):
-        reports.append(result, self.history_path)
-        self.history_view.refresh()
+        try:
+            reports.append(result, self.history_path)
+            self.history_view.refresh()
+        except OSError as e:  # a locked or unwritable history file must not leave Convert busy
+            self.convert_view.append_log(f"WARNING: could not update the history ({e})")
         self.convert_view.on_done(result)
         if not result.ok:
             self.set_status("Conversion failed")

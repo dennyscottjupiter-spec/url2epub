@@ -47,6 +47,11 @@ def test_summary_counts_ok_and_kb():
     assert reports.summary(rows) == {"total": 3, "ok": 2, "failed": 1, "total_kb": 150}
 
 
+def test_summary_ignores_non_numeric_size():
+    rows = [{"ok": True, "size_kb": 120}, {"ok": True, "size_kb": "big"}, {"ok": True, "size_kb": None}, {"ok": True}]
+    assert reports.summary(rows) == {"total": 4, "ok": 4, "failed": 0, "total_kb": 120}
+
+
 def test_export_csv_columns_and_bom(tmp_path):
     hist, dest = tmp_path / "h.jsonl", tmp_path / "h.csv"
     reports.append(OK, hist)
