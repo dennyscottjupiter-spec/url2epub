@@ -1,7 +1,7 @@
 ---
 title: url2epub
 status: current
-updated: 2026-11-07
+updated: 2026-11-11
 ---
 
 # 📖 url2epub
@@ -101,8 +101,8 @@ one untouched-by-desktop file. Pages switch instantly (Ctrl+1 … Ctrl+5).
 3. Grant PyDroid 3 the **Storage** permission (Android Settings → Apps →
    PyDroid 3 → Permissions) so it can save into **Downloads**.
 4. Open `url2epub.py` in PyDroid 3 and press the yellow **▶ Run** button.
-   - On first run it will `pip install` `requests` and `beautifulsoup4`
-     automatically. If that fails, use PyDroid 3's **menu → Pip** to install
+   - On first run it will `pip install` `requests`, `beautifulsoup4` and
+     `xclienttransaction` automatically. If that fails, use PyDroid 3's **menu → Pip** to install
      them by hand, then run again.
 5. **Paste the article URL** when prompted and press Enter.
 6. Find the finished `.epub` in your **Downloads** folder → open it with your
@@ -122,7 +122,9 @@ that follow the runtime order:
 URL ─▶ normalize ─▶ [special handler? e.g. X/Twitter] ─▶ fetch (retrying,
       Galaxy-S24 headers) ─▶ read title/author (JSON-LD ▸ og: ▸ <h1> ▸ <title>)
       ─▶ extract main content:
-             Reader-Mode scorer ▸ JSON-LD body ▸ AMP ▸ archive.today ▸ ask
+             best of: Reader-Mode scorer ▸ JSON-LD body ▸ noscript ▸
+             embedded state ▸ RSS feed
+             then if weak/cut off: AMP ▸ archive.today ▸ Wayback ▸ Jina ▸ ask
       ─▶ clean junk ─▶ embed images ─▶ split into chapters
       ─▶ write EPUB3 (a ZIP of XML) ─▶ save to Downloads
 ```

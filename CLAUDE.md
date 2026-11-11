@@ -4,7 +4,7 @@ Guidance for Claude Code (claude.ai/code) when working in this repository.
 
 ## What this is
 
-`url2epub.py` — one self-contained ~1,740-line script turning a web-article URL into a Kindle-friendly
+`url2epub.py` — one self-contained ~2,020-line script turning a web-article URL into a Kindle-friendly
 EPUB3. The engine stays one file (a hard product constraint). **It runs on Android only, inside
 [PyDroid 3](https://play.google.com/store/apps/details?id=ru.iiec.pydroid3).** Running the script itself
 under desktop CPython is how it's developed/tested, but is *not* a supported use.
@@ -125,9 +125,10 @@ Title/author from `<script type="application/ld+json">` first, then `og:`/meta t
 
 The local stage runs EVERY cheap strategy and keeps the **best** candidate by
 `quality = text_len * (1 - link_density)` — *not* the first to merely clear `MIN_GOOD_TEXT` (500 chars),
-which used to let a weak-but-passing extraction permanently block a better later stage. A JSON-LD
-`wordCount` far above what was extracted also escalates ("continue reading" truncations) even when the
-char count passed.
+which used to let a weak-but-passing extraction permanently block a better later stage. A candidate with
+no links/images/headings/lists (`_RICH_TAGS`) scores ×0.8, so formatted DOM text beats an equal plain
+copy. A JSON-LD `wordCount` more than 2× what was extracted marks it truncated ("continue reading" cuts)
+even when the char count passed. RSS and embedded-state candidates go through `clean_soup` like the rest.
 
 1. **Score-based DOM** (`extract_main_content` → `score_container`) — Reader-Mode heuristics: reward long
    paragraphs and comma counts, weight by `POSITIVE_HINTS`/`NEGATIVE_HINTS` class/id names, multiply down
@@ -144,7 +145,9 @@ char count passed.
    never BeautifulSoup**: `html.parser` treats `<link>` as void, so a bare Atom `<link>url</link>` is
    unreachable via bs4 (broke 3/10 feeds); the `"xml"` parser needs lxml, so it's out.
 
-If the best local candidate is still weak/truncated, escalate over the network, each step gated the same:
+If the best local candidate is still weak (`_is_weak`) or truncated, escalate over the network. Weak runs
+every step 6-10; truncated-but-not-weak runs only 6-8, a replacement must be longer (`_improves`), and a
+`[warn]` line is logged if the book may still be cut off:
 
 6. **AMP** — refetch the `<link rel="amphtml">` version (server-rendered plain HTML).
 7. **archive.today** (`fetch_via_archive()`) — on a blocked initial fetch (401/402/403/429/451) OR
@@ -177,7 +180,8 @@ the rest of the pipeline, since it hands back an already-built article, not a ra
   (uncompressed)**, then `META-INF/container.xml`, `EPUB/content.opf` (manifest + spine), `nav.xhtml`
   (EPUB3 TOC) + `toc.ncx` (legacy TOC), then XHTML/CSS/images. Every XHTML file **must be well-formed
   XML** — hence content is re-serialized through BeautifulSoup (void elements self-closed) and every
-  interpolated string passes through `xml()`.
+  interpolated string passes through `xml()`. `soup_to_xhtml_body(fragment, base_url)` makes every
+  `<a href>` absolute and unwraps `javascript:` links.
 
 Tuning knobs live in **Section 2** (`OUTPUT_DIR`, `TIMEOUT`, `MAX_IMAGE_BYTES`, `MIN_GOOD_TEXT`, `HEADERS`,
 `_DESKTOP_HEADERS`, junk/hint lists), plus `ARCHIVE_HOSTS`/`_JINA_HEADERS` (S4), `TWEET_URL_RE` (6B),
@@ -199,14 +203,14 @@ To find a symbol, `Grep` its name — the table says which section owns it.
 | 4  | 218  | fetch: retrying session, 403 UA retry, archive/Wayback/Jina recovery | `get_session`, `fetch_page`, `FetchError`, `_decode`, `fetch_via_archive`, `fetch_via_wayback`, `fetch_via_jina`, `ARCHIVE_HOSTS` |
 | 5  | 456  | metadata (title/author) incl. JSON-LD | `find_jsonld_article`, `detect_title`, `detect_author`, `iter_jsonld_objects` |
 | 6  | 538  | Reader-Mode extraction + JS-page fallbacks | `extract_main_content`, `score_container`, `link_density`, `jsonld_body_to_soup`, `find_amp_url`, `extract_from_noscript`, `extract_from_state`, `_looks_like_prose`, `extract_from_rss`, `find_rss_url` |
-| 6B | 797  | special-site: X / Twitter tweets (syndication JSON) | `tweet_to_article`, `fetch_tweet`, `_tweet_token`, `TWEET_URL_RE` |
-| 6C | 965  | special-site: X Articles (internal GraphQL, Draft.js, cookie auth) | `article_to_article`, `_article_once`, `_draftjs_to_html`, `_x_guest_client`, `_x_auth_client`, `_find_article_dict`, `_gql_get`, `ARTICLE_URL_RE`, `_GRAPHQL_REGISTRY`, `_LAST_ARTICLE_ERROR` |
-| 7  | 1400 | junk removal / soup cleanup | `clean_soup` |
-| 8  | 1445 | image download + EPUB embedding | `collect_images`, `pick_image_url`, `IMG_MIME` |
-| 9  | 1502 | chapter splitting on h1/h2 | `split_into_chapters`, `SPLIT_MARK` |
-| 10 | 1530 | hand-rolled EPUB3 writer (zip + templates) | `write_epub`, `soup_to_xhtml_body`, `XHTML_SHELL`, `CONTAINER_XML` |
-| 11 | 1675 | output-path resolution (Android Download → cwd) | `resolve_output_path` |
-| 12 | 1689 | orchestration: keep-best extraction, network escalation, X errors | `resolve_article`, `main`, `_candidate_quality`, `_is_truncated`, `_ARTICLE_ERROR_MESSAGES` |
+| 6B | 800  | special-site: X / Twitter tweets (syndication JSON) | `tweet_to_article`, `fetch_tweet`, `_tweet_token`, `TWEET_URL_RE` |
+| 6C | 968  | special-site: X Articles (internal GraphQL, Draft.js, cookie auth) | `article_to_article`, `_article_once`, `_draftjs_to_html`, `_x_guest_client`, `_x_auth_client`, `_find_article_dict`, `_gql_get`, `ARTICLE_URL_RE`, `_GRAPHQL_REGISTRY`, `_LAST_ARTICLE_ERROR` |
+| 7  | 1418 | junk removal / soup cleanup | `clean_soup` |
+| 8  | 1463 | image download + EPUB embedding | `collect_images`, `pick_image_url`, `IMG_MIME` |
+| 9  | 1520 | chapter splitting on h1/h2 | `split_into_chapters`, `SPLIT_MARK` |
+| 10 | 1548 | hand-rolled EPUB3 writer (zip + templates) | `write_epub`, `soup_to_xhtml_body`, `XHTML_SHELL`, `CONTAINER_XML` |
+| 11 | 1700 | output-path resolution (Android Download → cwd) | `resolve_output_path` |
+| 12 | 1714 | orchestration: keep-best extraction, network escalation, X errors | `resolve_article`, `main`, `_candidate_quality`, `_is_truncated`, `_is_weak`, `_improves`, `_RICH_TAGS`, `_ARTICLE_ERROR_MESSAGES` |
 
 ## Git workflow
 

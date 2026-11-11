@@ -15,10 +15,10 @@ X Articles support only — see Sec 6C). Never add a compiled dependency
 (lxml/Pillow/ebooklib/a JS engine).
 
 Pipeline (resolve_article, Sec 12): special-site handlers first (Sec 6B
-X/Twitter, Sec 6C X Articles), else generic fetch + 5-stage extraction
-fallback (DOM scorer -> JSON-LD articleBody -> AMP mirror -> archive.today
--> interactive full-page choice). Pages needing JS or a hard paywall can't
-be captured — no browser engine on PyDroid 3.
+X/Twitter, Sec 6C X Articles), else generic fetch, keep-best local stage
+(DOM scorer, JSON-LD articleBody, noscript, embedded state, RSS), then AMP
+-> archive.today -> Wayback -> Jina -> interactive full-page choice. Hard
+paywalls can't be captured — no browser engine on PyDroid 3.
 
 Output: /storage/emulated/0/Download/<Title>.epub, falls back to cwd.
 Usage: open in PyDroid 3, press Run, paste the URL when prompted (stdin only).
@@ -1000,7 +1000,8 @@ def tweet_to_article(url: str) -> "dict | None":
 # backoff (_ARTICLE_ATTEMPTS); a definitive miss returns None at once. When it
 # ultimately returns None for a recognised X URL, resolve_article() does NOT
 # fall through to the generic pipeline (that only yields a junk near-empty
-# EPUB for X's JS-only shell) — it exits with a clear "try again" message.
+# EPUB for X's JS-only shell) — it exits with the specific cause from
+# _ARTICLE_ERROR_MESSAGES (e.g. cookie steps when a login is needed).
 
 ARTICLE_URL_RE = re.compile(
     r"^https?://(?:[\w.-]+\.)?x\.com/(?P<handle>[^/]+)/article/(?P<id>\d+)",
