@@ -214,6 +214,23 @@ No feature branches — work happens directly on `main`. Every change gets an at
 `origin/main` before a task is done. "Full housekeeping" here means committed + pushed + no stray branches
 (not a merge — there's nothing to merge into).
 
+## Final verification (last step of every round, before "done")
+
+Run all of these; a round is done only when every one passes. Report each result, and name any you couldn't run.
+
+1. **Full suite:** `python3 -m pytest tests -q` → 0 failed (includes the offline e2e dummy conversion).
+2. **Tk noise:** `cmd /c "python3 -m pytest tests -q -s > %TEMP%\full.txt 2>&1"`, then count `invalid command name`
+   in that file → 0. Plain `-q` captures passing tests' output and hides this noise, so a `-q` count of 0 proves nothing.
+3. **Real engine pass:** convert 2-3 live URLs through the stdin pattern in "Running it" (one plain news
+   article, one newsletter/feed-backed post, one X post). Each EPUB must be a valid zip with `mimetype`
+   first, open its chapters, and show images and absolute links. Keep it short: this PC is slow.
+4. **Real desktop pass:** launch `python3 desktop/url2epub_gui.py`, convert a live URL, then click Open EPUB,
+   Show in folder, History (open/reveal/export CSV + Markdown), Settings, About (new version + changelog
+   entry visible). Take a screenshot of each page. tkinter is not a browser page, so Playwright can't drive it.
+   Use computer-use when available; otherwise say so and list exactly what remains unclicked.
+5. **No stray files:** `git status --short` clean, with no EPUBs or `x_cookies.txt` left in the repo.
+   Do not rebuild `dist\url2epub.exe` unless asked.
+
 ## Known gotcha: bs4 ≥ 4.13 crash (the REAL cause)
 
 The script targets the older BeautifulSoup PyDroid 3 ships but must not crash on newer bs4 (e.g. 4.15 on
