@@ -1,6 +1,6 @@
 # ---
 # purpose: Fast native theme: ttk "clam" restyled from palette tokens, recolor listeners, Win11 title bar
-# exports: apply(), listen(), colors(), current(), px(), reduced_motion(), rrect()
+# exports: apply(), listen(), colors(), current(), px(), reduced_motion(), rrect(), cancel_title_bar()
 # depends: ui/palette.py
 # gotcha: sv-ttk was dropped on purpose: its image-drawn widgets made every tab switch take 1-3 s on this PC
 # ---
@@ -58,7 +58,18 @@ def apply(root, name):
     root.configure(background=c["bg"])
     for fn in getattr(root, "_recolor", []):
         fn(c)
-    root.after(30, _title_bar, root, c)
+    cancel_title_bar(root)  # one poll at a time: re-applying the theme must not stack a second
+    root._title_bar_id = root.after(30, _title_bar, root, c)
+
+
+def cancel_title_bar(root):
+    # the poll re-arms itself while the window is unmapped, so destroy must stop it
+    after_id = root.__dict__.pop("_title_bar_id", None)
+    if after_id:
+        try:
+            root.after_cancel(after_id)
+        except tk.TclError:  # the Tcl interpreter may already be torn down
+            pass
 
 
 def _configure(s, c):
@@ -131,13 +142,14 @@ def _hex_to_colorref(h):
 
 
 def _title_bar(root, c):
+    root.__dict__.pop("_title_bar_id", None)  # this poll has fired; a re-arm below sets a fresh id
     # DWM 20 = dark mode (Win10 20H1+); 35/36 = caption/text color (Win11, ignored elsewhere)
     if sys.platform != "win32":
         return
     try:
         hwnd = ctypes.windll.user32.GetParent(root.winfo_id())
         if not hwnd or not root.winfo_ismapped():  # frame not created yet: try again shortly
-            root.after(50, _title_bar, root, c)
+            root._title_bar_id = root.after(50, _title_bar, root, c)
             return
         dwm = ctypes.windll.dwmapi.DwmSetWindowAttribute
         dark = ctypes.c_int(1 if current() == "dark" else 0)

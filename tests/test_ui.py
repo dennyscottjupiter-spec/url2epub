@@ -304,3 +304,12 @@ def test_full_page_dialog_error_does_not_hang(app, monkeypatch):
     monkeypatch.setattr(dialogs, "ask_full_page", broken)
     convert(ui, "https://example.com/a")
     assert ui.convert_view.cover.result is not None
+
+
+def test_destroy_cancels_title_bar_timer(tmp_path):
+    ui = App(settings_path=tmp_path / "s.json", history_path=tmp_path / "h.jsonl")
+    ui.withdraw()
+    ui.update()
+    assert "_title_bar_id" in ui.__dict__  # still polling: the window is not mapped
+    ui.destroy()
+    assert "_title_bar_id" not in ui.__dict__

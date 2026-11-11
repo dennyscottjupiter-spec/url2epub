@@ -72,6 +72,7 @@ class App(tk.Tk):
 
     def destroy(self):
         self.after_cancel(self._pump_id)
+        theme.cancel_title_bar(self)
         super().destroy()
 
     def _set_icon(self):
