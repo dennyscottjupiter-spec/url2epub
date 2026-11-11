@@ -76,3 +76,16 @@ def test_export_markdown_table_and_escaping(tmp_path):
     assert "| OK | My Title | 120 | 3 | 2 | https://e.com/a |" in text
     assert "| OK | A \\| B | 5 | 0 | 0 | https://e.com/c |" in text
     assert "| FAILED |  | 0 | 0 | 0 | https://e.com/b |" in text
+
+
+def test_export_csv_neutralises_formulas(tmp_path):
+    dest = tmp_path / "h.csv"
+    rows = [{"ok": True, "title": '=HYPERLINK("http://x","y")', "author": "@ann",
+             "url": "https://e.com/a", "size_kb": -5, "error": "+1"}]
+    reports.export_csv(rows, dest)
+    out = list(csv.DictReader(io.StringIO(dest.read_bytes().decode("utf-8-sig"))))[0]
+    assert out["title"].startswith("'=")
+    assert out["author"] == "'@ann"
+    assert out["error"] == "'+1"
+    assert out["url"] == "https://e.com/a"
+    assert out["size_kb"] == "-5"

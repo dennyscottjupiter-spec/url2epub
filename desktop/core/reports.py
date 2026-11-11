@@ -62,12 +62,19 @@ def summary(rows: list[dict]) -> dict:
     }
 
 
+def _csv_safe(value):
+    # Excel runs a cell starting with these as a formula; a leading quote makes it plain text
+    if isinstance(value, str) and value[:1] in ("=", "+", "-", "@", "\t", "\r"):
+        return "'" + value
+    return value
+
+
 def export_csv(rows: list[dict], dest) -> None:
     # utf-8-sig adds a BOM so Excel opens accented titles correctly
     with open(dest, "w", encoding="utf-8-sig", newline="") as fh:
         writer = csv.DictWriter(fh, fieldnames=CSV_COLUMNS, extrasaction="ignore")
         writer.writeheader()
-        writer.writerows(rows)
+        writer.writerows({k: _csv_safe(v) for k, v in r.items()} for r in rows)
 
 
 def _cell(value) -> str:
