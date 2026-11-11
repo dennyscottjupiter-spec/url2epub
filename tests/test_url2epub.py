@@ -434,3 +434,17 @@ def test_gql_get_non_json_body_returns_none(monkeypatch):
 def test_needs_login_message_names_output_folder():
     msg = u._ARTICLE_ERROR_MESSAGES[u._ARTICLE_ERROR_NEEDS_LOGIN]
     assert "output folder" in msg and "auth_token=<value>" in msg
+
+
+def test_links_are_made_absolute():
+    out = u.soup_to_xhtml_body(
+        '<p><a href="/a?x=1&y=2">A</a><a href="b.html">B</a><a href="#n1">N</a>'
+        '<a href="https://o.org/z">Z</a><a href="mailto:a@b.c">M</a>'
+        '<a href="javascript:void(0)">J</a><a>bare</a></p>',
+        "https://e.com/dir/page.html")
+    assert 'href="https://e.com/a?x=1&amp;y=2"' in out
+    assert 'href="https://e.com/dir/b.html"' in out
+    assert 'href="#n1"' in out and 'href="https://o.org/z"' in out
+    assert 'href="mailto:a@b.c"' in out
+    assert "javascript:" not in out and ">J<" in out
+    assert 'href="/a"' in u.soup_to_xhtml_body('<a href="/a">A</a>')

@@ -1566,12 +1566,19 @@ CONTAINER_XML = """<?xml version="1.0" encoding="utf-8"?>
 </container>"""
 
 
-def soup_to_xhtml_body(html_fragment: str) -> str:
+def soup_to_xhtml_body(html_fragment: str, base_url: str = "") -> str:
     """Re-serialize through BeautifulSoup for XHTML-style void elements
        (<img/>, <br/>) and & < > escaping, as EPUB's XML parser requires."""
     frag = BeautifulSoup(html_fragment, PARSER)
     for bad in frag.find_all(["html", "body", "head"]):
         bad.unwrap()
+    # #fragment links stay as-is: they would point into the wrong chapter file.
+    for a in frag.find_all("a", href=True):
+        href = a["href"].strip()
+        if href.lower().startswith("javascript:"):
+            a.unwrap()
+        elif base_url and href and not href.startswith("#"):
+            a["href"] = urljoin(base_url, href)
     # Framework/Word markup (`:class`, `@click`, `x-on:click`, `<o:p>`) uses
     # names that are not legal (or undeclared-prefix) XML — drop/unwrap them.
     for tag in frag.find_all(True):
@@ -1611,7 +1618,7 @@ def write_epub(path: str, title: str, author: str, source_url: str,
         chapters = [(title, chapters[0][1])]
     chap_files = [] # (filename, xhtml_string, chapter_title)
     for i, (chap_title, chap_html) in enumerate(chapters, 1):
-        body = soup_to_xhtml_body(chap_html)
+        body = soup_to_xhtml_body(chap_html, source_url)
         if single:
             if BeautifulSoup(body, PARSER).find(["h1", "h2"]) is None:
                 body = f"<h1>{xml(chap_title)}</h1>" + body
