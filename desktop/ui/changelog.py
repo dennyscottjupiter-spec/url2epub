@@ -4,6 +4,17 @@
 # gotcha: add a new entry at the TOP and bump ui/__init__.VERSION in the same commit
 # ---
 ENTRIES = [
+    ("Version 1.1.1", "11 November 2026", [
+        "Newsletter articles taken from a feed no longer show raw HTML tags or leftover widgets.",
+        "X Articles: one failed lookup no longer breaks every retry.",
+        "X Articles: the sign-in help now names the right folder for x_cookies.txt.",
+        "Links inside a book now point to the original website instead of nowhere.",
+        "The formatted article is kept when a site also ships a plain-text copy.",
+        "Cut-off articles are looked up in web archives, and the log warns when a book may be incomplete.",
+        "Open EPUB explains what to do when Windows has no app for EPUB files.",
+        "A history problem can no longer leave the Convert page stuck.",
+        "CSV export is safe to open in Excel even with odd article titles.",
+    ]),
     ("Version 1.1.0", "8 November 2026", [
         "Pages open instantly: the slow sv-ttk theme is gone. Switching pages went from about 2.5 s to under 0.1 s.",
         "New look, Bindery: midnight bookcloth with gilt in dark mode, e-ink paper in light mode.",
